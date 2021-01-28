@@ -194,6 +194,10 @@ namespace {
                    cl::init(false),
                    cl::cat(LinkCat));
 
+  cl::opt<bool> WithUBSanRuntime("ubsan-runtime",
+                                 cl::desc("Link with UBSan runtime."),
+                                 cl::init(false), cl::cat(LinkCat));
+
   cl::opt<std::string> RuntimeBuild(
       "runtime-build",
       cl::desc("Link with versions of the runtime library that were built with "
@@ -844,10 +848,6 @@ static const char *modelledExternals[] = {
   "_Znwj",
   "_Znam",
   "_Znwm",
-  "__ubsan_handle_add_overflow",
-  "__ubsan_handle_sub_overflow",
-  "__ubsan_handle_mul_overflow",
-  "__ubsan_handle_divrem_overflow",
 };
 
 // Symbols we aren't going to warn about
@@ -1409,6 +1409,15 @@ int main(int argc, char **argv, char **envp) {
 
     std::string libcPrefix = (Libc == LibcType::UcLibc ? "__user_" : "");
     preparePOSIX(loadedModules, libcPrefix);
+  }
+
+  if (WithUBSanRuntime) {
+    SmallString<128> Path(Opts.LibraryDir);
+    llvm::sys::path::append(Path, "libkleeUBSan" + opt_suffix + ".bca");
+    if (!klee::loadFile(Path.c_str(), mainModule->getContext(), loadedModules,
+                        errorMsg))
+      klee_error("error loading UBSan support '%s': %s", Path.c_str(),
+                 errorMsg.c_str());
   }
 
   if (Libcxx) {
