@@ -56,9 +56,6 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
-#if LLVM_VERSION_CODE < LLVM_VERSION(8, 0)
-#include "llvm/IR/CallSite.h"
-#endif
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
@@ -1800,7 +1797,6 @@ void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
     }
 #endif
 
-#if LLVM_VERSION_CODE >= LLVM_VERSION(7, 0)
     case Intrinsic::fshr:
     case Intrinsic::fshl: {
       ref<Expr> op1 = eval(ki, 1, state).value;
@@ -1825,7 +1821,6 @@ void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
       }
       break;
     }
-#endif
 
     // va_arg is handled by caller and intrinsic lowering, see comment for
     // ExecutionState::varargs
@@ -1946,21 +1941,10 @@ void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
       uint64_t offsets[callingArgs]; // offsets of variadic arguments
       uint64_t argWidth;             // width of current variadic argument
 
-#if LLVM_VERSION_CODE >= LLVM_VERSION(8, 0)
       const CallBase &cs = cast<CallBase>(*i);
-#else
-      const CallSite cs(i);
-#endif
       for (unsigned k = funcArgs; k < callingArgs; k++) {
         if (cs.isByValArgument(k)) {
-#if LLVM_VERSION_CODE >= LLVM_VERSION(9, 0)
           Type *t = cs.getParamByValType(k);
-#else
-          auto arg = cs.getArgOperand(k);
-          Type *t = arg->getType();
-          assert(t->isPointerTy());
-          t = t->getPointerElementType();
-#endif
           argWidth = kmodule->targetData->getTypeSizeInBits(t);
         } else {
           argWidth = arguments[k]->getWidth();
@@ -2393,13 +2377,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
           Expr::Width to = getWidthForLLVMType(t);
             
           if (from != to) {
-#if LLVM_VERSION_CODE >= LLVM_VERSION(8, 0)
             const CallBase &cs = cast<CallBase>(*caller);
-#else
-            const CallSite cs(isa<InvokeInst>(caller)
-                                  ? CallSite(cast<InvokeInst>(caller))
-                                  : CallSite(cast<CallInst>(caller)));
-#endif
 
             // XXX need to check other param attrs ?
             bool isSExt = cs.hasRetAttr(llvm::Attribute::SExt);
@@ -2657,14 +2635,8 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     if (isa<DbgInfoIntrinsic>(i))
       break;
 
-#if LLVM_VERSION_CODE >= LLVM_VERSION(8, 0)
     const CallBase &cs = cast<CallBase>(*i);
     Value *fp = cs.getCalledOperand();
-#else
-    const CallSite cs(i);
-    Value *fp = cs.getCalledValue();
-#endif
-
     unsigned numArgs = cs.arg_size();
     Function *f = getTargetFunction(fp, state);
 
@@ -3086,8 +3058,6 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
   }
 
     // Floating point instructions
-
-#if LLVM_VERSION_CODE >= LLVM_VERSION(8, 0)
   case Instruction::FNeg: {
     ref<ConstantExpr> arg =
         toConstant(state, eval(ki, 0, state).value, "floating point");
@@ -3099,7 +3069,6 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     bindLocal(ki, state, ConstantExpr::alloc(Res.bitcastToAPInt()));
     break;
   }
-#endif
 
   case Instruction::FAdd: {
     ref<ConstantExpr> left = toConstant(state, eval(ki, 0, state).value,
@@ -5046,14 +5015,7 @@ size_t Executor::getAllocationAlignment(const llvm::Value *allocSite) const {
     type = AI->getAllocatedType();
   } else if (isa<InvokeInst>(allocSite) || isa<CallInst>(allocSite)) {
     // FIXME: Model the semantics of the call to use the right alignment
-#if LLVM_VERSION_CODE >= LLVM_VERSION(8, 0)
     const CallBase &cs = cast<CallBase>(*allocSite);
-#else
-    llvm::Value *allocSiteNonConst = const_cast<llvm::Value *>(allocSite);
-    const CallSite cs(isa<InvokeInst>(allocSiteNonConst)
-                          ? CallSite(cast<InvokeInst>(allocSiteNonConst))
-                          : CallSite(cast<CallInst>(allocSiteNonConst)));
-#endif
     llvm::Function *fn =
         klee::getDirectCallTarget(cs, /*moduleIsFullyLinked=*/true);
     if (fn)
