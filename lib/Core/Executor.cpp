@@ -95,7 +95,7 @@ typedef unsigned TypeSize;
 #include <vector>
 #include <list>
 #include <time.h>
-#include <sys/uio.h>
+#include <unistd.h>
 
 using namespace llvm;
 using namespace klee;
@@ -2106,14 +2106,21 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         uint32_t BIdx = jove_BIdx;
         uint32_t BBIdx = CI->getZExtValue();
 
-        struct iovec iov_arr[3] = {{.iov_base = &BIdx,   .iov_len = sizeof(uint32_t)},
-                                   {.iov_base = &BBIdx,  .iov_len = sizeof(uint32_t)},
-                                   {.iov_base = &target, .iov_len = sizeof(uint64_t)}};
+        constexpr unsigned RECORD_LEN = 2 * sizeof(uint32_t) + sizeof(uint64_t);
+        uint8_t record[RECORD_LEN];
 
-        ssize_t ret = ::writev(jove_recover_pipefd, iov_arr, 3);
+        *reinterpret_cast<uint32_t *>(&record[0 * sizeof(uint32_t)]) = BIdx;
+        *reinterpret_cast<uint32_t *>(&record[1 * sizeof(uint32_t)]) = BBIdx;
+        *reinterpret_cast<uint64_t *>(&record[2 * sizeof(uint32_t)]) = target;
 
-        if (ret == 2 * sizeof(uint32_t) + sizeof(uint64_t)) {
-          HumanOut() << "failed to write to jove_recover_pipefd\n";
+        //
+        // we have to do it in a single write
+        //
+        ssize_t ret = ::write(jove_recover_pipefd, &record[0], RECORD_LEN);
+
+        if (ret != RECORD_LEN) {
+          HumanOut() << llvm::formatv(
+              "failed to write to jove_recover_pipefd ({0})\n", ret);
         }
       };
 
