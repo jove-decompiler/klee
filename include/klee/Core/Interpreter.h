@@ -14,15 +14,23 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <list>
 
 struct KTest;
 
 namespace llvm {
 class Function;
+class Instruction;
+class BasicBlock;
 class LLVMContext;
 class Module;
 class raw_ostream;
 class raw_fd_ostream;
+class CallInst;
+}
+
+namespace jove {
+typedef std::list<llvm::BasicBlock *> path_t;
 }
 
 namespace klee {
@@ -136,6 +144,15 @@ public:
                                  int argc,
                                  char **argv,
                                  char **envp) = 0;
+
+  virtual void
+  jove_AnalyzeIndirectJump(const jove::path_t &,
+                           llvm::CallInst *JoveRecoverBBCall,
+                           void *shared_memory,
+                           int recover_pipefd,
+                           unsigned BIdx) = 0;
+
+  virtual void joveRun(ExecutionState &initialState) = 0;
 
   /*** Runtime options ***/
 

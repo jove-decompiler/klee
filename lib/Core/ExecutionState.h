@@ -25,6 +25,11 @@
 #include <memory>
 #include <set>
 #include <vector>
+#include <list>
+
+namespace llvm {
+class BasicBlock;
+}
 
 namespace klee {
 class Array;
@@ -240,6 +245,11 @@ public:
   /// @brief Disables forking for this state. Set by user code
   bool forkDisabled = false;
 
+  struct {
+    const std::list<llvm::BasicBlock *> *ptrPath = nullptr;
+    std::list<llvm::BasicBlock *>::const_iterator pos;
+    llvm::Instruction* recoverCall = nullptr;
+  } jove;
 public:
 #ifdef KLEE_UNITTEST
   // provide this function only in the context of unittests

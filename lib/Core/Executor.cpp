@@ -78,6 +78,7 @@
 typedef unsigned TypeSize;
 #endif
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/FormatVariadic.h"
 
 #include <algorithm>
 #include <cassert>
@@ -92,6 +93,9 @@ typedef unsigned TypeSize;
 #include <string>
 #include <sys/mman.h>
 #include <vector>
+#include <list>
+#include <time.h>
+#include <sys/uio.h>
 
 using namespace llvm;
 using namespace klee;
@@ -536,7 +540,9 @@ Executor::setModule(std::vector<std::unique_ptr<llvm::Module>> &modules,
   preservedFunctions.push_back("memcmp");
   preservedFunctions.push_back("memmove");
 
+#if 0
   kmodule->optimiseAndPrepare(opts, preservedFunctions);
+#endif
   kmodule->checkModule();
 
   // 4.) Manifest the module
@@ -671,6 +677,15 @@ void Executor::allocateGlobalObjects(ExecutionState &state) {
       addr = Expr::createPointer(mo->address);
       legalFunctions.emplace(mo->address, &f);
     }
+
+    globalAddresses.emplace(&f, addr);
+  }
+
+  // XXX ifuncs hack
+  for (GlobalIFunc &f : m->ifuncs()) {
+    auto mo = memory->allocate(8, false, true, &f, 8);
+    ref<ConstantExpr> addr = Expr::createPointer(mo->address);
+    //legalFunctions.emplace(mo->address, &f);
 
     globalAddresses.emplace(&f, addr);
   }
@@ -813,11 +828,12 @@ void Executor::initializeGlobalObjects(ExecutionState &state) {
         addr = externalDispatcher->resolveSymbol(v.getName().str());
       }
       if (!addr) {
-        klee_error("Unable to load symbol(%.*s) while initializing globals",
-                   static_cast<int>(v.getName().size()), v.getName().data());
-      }
-      for (unsigned offset = 0; offset < mo->size; offset++) {
-        os->write8(offset, static_cast<unsigned char *>(addr)[offset]);
+        klee_warning("Unable to load symbol(%.*s) while initializing globals",
+                     static_cast<int>(v.getName().size()), v.getName().data());
+      } else {
+        for (unsigned offset = 0; offset < mo->size; offset++) {
+          os->write8(offset, static_cast<unsigned char *>(addr)[offset]);
+        }
       }
     } else if (v.hasInitializer()) {
       initializeGlobalObject(state, os, v.getInitializer(), 0);
@@ -2010,6 +2026,24 @@ void Executor::transferToBasicBlock(BasicBlock *dst, BasicBlock *src,
     PHINode *first = static_cast<PHINode*>(state.pc->inst);
     state.incomingBBIndex = first->getBasicBlockIndex(src);
   }
+
+  assert(state.jove.ptrPath);
+  const std::list<BasicBlock *> &Path = *state.jove.ptrPath;
+
+  std::list<BasicBlock*>::const_iterator bb_it = state.jove.pos;
+  assert(bb_it != Path.end());
+  ++bb_it;
+
+  assert(bb_it != Path.end());
+  if (*bb_it != dst) {
+    HumanOut() << llvm::formatv("killing state not on path ({0})\n", dst->getName());
+    HumanOut().flush();
+    terminateState(state);
+  } else {
+    HumanOut() << llvm::formatv("advancing state on path ({0})\n", dst->getName());
+    HumanOut().flush();
+    ++state.jove.pos;
+  }
 }
 
 /// Compute the true target of a function call, resolving LLVM aliases
@@ -2043,6 +2077,149 @@ Function* Executor::getTargetFunction(Value *calledVal, ExecutionState &state) {
 }
 
 void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
+  constexpr bool hack = false;
+  if (!hack) {
+#if 1
+    if (ki->inst->getParent() != (*state.jove.pos)) {
+      HumanOut() << "killling state not on path\n";
+      HumanOut().flush();
+      terminateState(state);
+      return;
+    }
+#else
+    assert(ki->inst->getParent() == *state.jove.pos);
+#endif
+
+    assert(state.jove.ptrPath);
+    const std::list<BasicBlock *> &Path = *state.jove.ptrPath;
+
+    if (std::next(state.jove.pos) == Path.end() &&
+        ki->inst == state.jove.recoverCall) {
+      HumanOut() << "reached indirect jump.\n";
+
+      ref<Expr> pc = eval(ki, 2, state).value;
+
+      auto target_recovered = [&](uint64_t target) -> void {
+        auto *CI = dyn_cast<ConstantInt>(state.jove.recoverCall->getOperand(0));
+        assert(CI);
+
+        uint32_t BIdx = jove_BIdx;
+        uint32_t BBIdx = CI->getZExtValue();
+
+        struct iovec iov_arr[3] = {{.iov_base = &BIdx,   .iov_len = sizeof(uint32_t)},
+                                   {.iov_base = &BBIdx,  .iov_len = sizeof(uint32_t)},
+                                   {.iov_base = &target, .iov_len = sizeof(uint64_t)}};
+
+        ssize_t ret = ::writev(jove_recover_pipefd, iov_arr, 3);
+
+        if (ret == 2 * sizeof(uint32_t) + sizeof(uint64_t)) {
+          HumanOut() << "failed to write to jove_recover_pipefd\n";
+        }
+      };
+
+      if (ref<ConstantExpr> CE = dyn_cast<ConstantExpr>(pc)) {
+        HumanOut() << "pc is constant.\n";
+
+        target_recovered(CE->getZExtValue());
+      } else {
+        HumanOut() << "expression for program counter:\n";
+        pc->dump();
+        HumanOut() << '\n';
+
+        std::set<uint64_t> known_targets;
+
+        auto process_target = [&](uint64_t target) -> bool {
+          bool res = known_targets.find(target) == known_targets.end();
+
+          if (res) {
+            known_targets.insert(target);
+            target_recovered(target);
+
+            addConstraint(
+                state,
+                Expr::createIsZero(EqExpr::create(
+                    pc,
+                    ConstantExpr::alloc(
+                        target,
+                        getWidthForLLVMType(state.jove.recoverCall->getOperand(1)->getType())))));
+          }
+
+          return res;
+        };
+
+        assert(jove_shared_memory);
+        int *const spin = reinterpret_cast<int *>(jove_shared_memory);
+
+        auto do_spin_lock = [](int *spin) -> void {
+          while (__sync_lock_test_and_set(spin, true)) {
+            sched_yield();
+          }
+        };
+
+        auto do_spin_unlock = [](int *spin) -> void {
+          __sync_lock_release(spin);
+        };
+
+        uint64_t last_target = 0;
+        for (;;) {
+          ref<ConstantExpr> CE;
+          bool success =
+              solver->getValue(state.constraints, pc, CE, state.queryMetaData);
+
+          if (!success)
+            break;
+          if (!CE)
+            break;
+
+          uint64_t our_target = CE->getZExtValue();
+
+          HumanOut() << llvm::formatv("our_target: {0:x}\n", our_target);
+
+          if (our_target == last_target) {
+            HumanOut() << "solver produced duplicate target\n";
+            break;
+          }
+          last_target = our_target;
+
+          do_spin_lock(spin);
+          {
+            uint64_t *p = reinterpret_cast<uint64_t *>(spin + 1);
+
+            while (*p)
+              process_target(*p++);
+
+            if (process_target(our_target))
+              *p = our_target; /* publish */
+          }
+          do_spin_unlock(spin);
+        }
+
+#if 0
+        assert(!known_targets.empty());
+        HumanOut() << "known targets:";
+        for (uint64_t target : known_targets)
+          HumanOut() << llvm::formatv(" {0:x}", target);
+        HumanOut() << '\n';
+#endif
+      }
+
+#if 0
+        std::string constraint_log;
+        getConstraintLog(state, constraint_log);
+        llvm::errs() << constraint_log << '\n';
+#endif
+
+      HumanOut().flush();
+
+      terminateState(state);
+      haltExecution = true;
+      return;
+    }
+
+    HumanOut() << llvm::formatv("  {0}\n", *ki->inst);
+    HumanOut().flush();
+  }
+
   Instruction *i = ki->inst;
   switch (i->getOpcode()) {
     // Control flow
@@ -2396,6 +2573,12 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       terminateStateOnExecError(state, "inline assembly is unsupported");
       break;
     }
+
+#define CONFIG_JOVE
+#if defined(CONFIG_JOVE)
+    if (!i->getType()->isVoidTy())
+      bindLocal(ki, state, joveGetUninitSymRead(state, i->getType()));
+#else
     // evaluate arguments
     std::vector< ref<Expr> > arguments;
     arguments.reserve(numArgs);
@@ -2483,9 +2666,13 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         free = res.second;
       } while (free);
     }
+#endif
     break;
   }
   case Instruction::PHI: {
+    if (state.incomingBBIndex == 0xDEADBEEF)
+      break;
+
     ref<Expr> result = eval(ki, state.incomingBBIndex, state).value;
     bindLocal(ki, state, result);
     break;
@@ -4213,6 +4400,8 @@ void Executor::executeMemoryOperation(ExecutionState &state,
 
   // we are on an error path (no resolution, multiple resolution, one
   // resolution with out of bounds)
+  HumanOut() << "executeMemoryInstruction error path\n";
+  return;
 
   address = optimizer.optimizeExpr(address, true);
   ResolutionList rl;  
@@ -4445,6 +4634,140 @@ void Executor::runFunctionAsMain(Function *f,
 
   if (statsTracker)
     statsTracker->done();
+}
+
+void Executor::jove_AnalyzeIndirectJump(const std::list<llvm::BasicBlock *> &Path,
+                                        llvm::CallInst *Call,
+                                        void *shared_memory,
+                                        int recover_pipefd,
+                                        unsigned BIdx) {
+  this->jove_shared_memory = shared_memory;
+  this->jove_recover_pipefd = recover_pipefd;
+  this->jove_BIdx = BIdx;
+
+  srand(::time(nullptr));
+  srandom(::time(nullptr));
+
+  Function *f = Call->getParent()->getParent();
+  KFunction *kf = kmodule->functionMap[f];
+  assert(kf);
+
+  ExecutionState *state = new ExecutionState(kmodule->functionMap[f]);
+  state->incomingBBIndex = 0xDEADBEEF;
+  state->jove.ptrPath = &Path;
+  state->jove.pos = Path.begin();
+  state->jove.recoverCall = Call;
+
+  if (pathWriter)
+    state->pathOS = pathWriter->open();
+  if (symPathWriter)
+    state->symPathOS = symPathWriter->open();
+  if (statsTracker)
+    statsTracker->framePushed(*state, 0);
+
+  //
+  // make all function arguments be symbolic (TODO stackpointer)
+  //
+  unsigned i = 0;
+  for (Function::arg_iterator a_it = f->arg_begin(); a_it != f->arg_end(); ++a_it, ++i)
+    bindArgument(
+        kf, i, *state,
+        joveGetUninitSymRead(*state, a_it->getType(),
+                             "jove_symbolic_" + (a_it->getName().str().empty()
+                                                     ? "arg"
+                                                     : a_it->getName().str())));
+
+  //
+  // initialize everything to be symbolic
+  //
+  for (BasicBlock &BB : *f) {
+    for (Instruction &I : BB) {
+      if (I.getType()->isVoidTy())
+        continue;
+
+      KInstruction** kip = kf->joveInstructionMap[&I];
+      assert(kip);
+      KInstruction *ki = *kip;
+      assert(ki);
+
+      bindLocal(ki, *state, joveGetUninitSymRead(*state, I.getType()));
+    }
+  }
+
+  initializeGlobals(*state);
+
+  processTree = std::make_unique<PTree>(state);
+
+  {
+    Instruction *firstInstr = &(*(*Path.begin())->begin());
+    state->pc = kf->joveInstructionMap[firstInstr];
+  }
+
+  joveRun(*state);
+  processTree = nullptr;
+
+  // hack to clear memory objects
+  delete memory;
+  memory = new MemoryManager(NULL);
+
+  globalObjects.clear();
+  globalAddresses.clear();
+
+  if (statsTracker)
+    statsTracker->done();
+}
+
+void Executor::joveRun(ExecutionState &initialState) {
+  bindModuleConstants();
+
+  // Delay init till now so that ticks don't accrue during optimization and such.
+  timers.reset();
+
+  states.insert(&initialState);
+
+  // main interpreter loop
+  while (!states.empty() && !haltExecution) {
+    ExecutionState& state = *(*states.begin());
+    KInstruction *ki = state.pc;
+    stepInstruction(state);
+
+    executeInstruction(state, ki);
+    timers.invoke();
+    if (::dumpStates) dumpStates();
+    if (::dumpPTree) dumpPTree();
+
+    updateStates(&state);
+
+    if (!checkMemoryUsage()) {
+      // update searchers when states were terminated early due to memory pressure
+      updateStates(nullptr);
+    }
+  }
+
+  delete searcher;
+  searcher = nullptr;
+
+  doDumpStates();
+}
+
+MemoryObject* Executor::joveGetUninitSym(ExecutionState& state, Type* ty, const std::string& name) {
+  return joveGetUninitSym(state, kmodule->targetData->getTypeStoreSize(ty), name);
+}
+
+MemoryObject* Executor::joveGetUninitSym(ExecutionState& state, unsigned bytes, const std::string& name) {
+  MemoryObject* mo = memory->allocate(bytes, false, false,  nullptr, 1);
+  executeMakeSymbolic(state, mo, (!name.empty() ? name : "jove_symbolic_read"));
+  return mo;
+}
+
+ref<Expr> Executor::joveGetUninitSymRead(ExecutionState& state, Expr::Width w, const std::string& name) {
+  MemoryObject* mo = joveGetUninitSym(state, (w/8 != 0 ? w/8 : 1), name);
+  const ObjectState* os = state.addressSpace.findObject(mo);
+  return os->read(0, w);
+}
+
+ref<Expr> Executor::joveGetUninitSymRead(ExecutionState& state, Type* ty, const std::string& name) {
+  return joveGetUninitSymRead(state, kmodule->targetData->getTypeSizeInBits(ty), name);
 }
 
 unsigned Executor::getPathStreamID(const ExecutionState &state) {

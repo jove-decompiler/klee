@@ -49,6 +49,9 @@ namespace klee {
         return ConstantExpr::alloc(cf->getValueAPF().bitcastToAPInt());
       } else if (const GlobalValue *gv = dyn_cast<GlobalValue>(c)) {
         auto it = globalAddresses.find(gv);
+        if (it == globalAddresses.end()) {
+          llvm::errs() << "WTF? " << *gv << '\n';
+        }
         assert(it != globalAddresses.end());
         return it->second;
       } else if (isa<ConstantPointerNull>(c)) {
