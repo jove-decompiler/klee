@@ -310,9 +310,11 @@ Function *klee::getDirectCallTarget(
 
   // NOTE: This assert may fire, it isn't necessarily a problem and
   // can be disabled, I just wanted to know when and if it happened.
+#if 0
   (void) viaConstantExpr;
   assert((!viaConstantExpr) &&
          "FIXME: Unresolved direct target for a constant expression");
+#endif
   return nullptr;
 }
 

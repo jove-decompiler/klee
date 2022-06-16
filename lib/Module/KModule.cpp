@@ -491,6 +491,7 @@ KFunction::KFunction(llvm::Function *_function,
         }
       }
 
+      joveInstructionMap[inst] = instructions + i;
       instructions[i++] = ki;
     }
   }

@@ -208,6 +208,14 @@ private:
   /// Typeids used during exception handling
   std::vector<ref<Expr>> eh_typeids;
 
+  void *jove_shared_memory = nullptr;
+  int jove_recover_pipefd = -1;
+  unsigned jove_BIdx;
+
+  llvm::raw_ostream &HumanOut(void) {
+    return llvm::errs();
+  }
+
   /// Return the typeid corresponding to a certain `type_info`
   ref<ConstantExpr> getEhTypeidFor(ref<Expr> type_info);
 
@@ -515,6 +523,25 @@ public:
 
   void runFunctionAsMain(llvm::Function *f, int argc, char **argv,
                          char **envp) override;
+
+  //
+  // jove
+  //
+  MemoryObject *joveGetUninitSym(ExecutionState &state, unsigned bytes,
+                                 const std::string &name = "");
+  MemoryObject *joveGetUninitSym(ExecutionState &, llvm::Type *,
+                                 const std::string &name = "");
+  ref<Expr> joveGetUninitSymRead(ExecutionState &, unsigned bytes,
+                                 const std::string &name = "");
+  ref<Expr> joveGetUninitSymRead(ExecutionState &state, llvm::Type *,
+                                 const std::string &name = "");
+
+  void jove_AnalyzeIndirectJump(const jove::path_t &,
+                                llvm::CallInst *recoverBBCall,
+                                void *shared_memory,
+                                int recover_pipefd,
+                                unsigned BIdx) override;
+  void joveRun(ExecutionState &initialState) override;
 
   /*** Runtime options ***/
 

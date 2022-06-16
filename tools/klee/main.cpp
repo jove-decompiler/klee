@@ -40,16 +40,20 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/FormatVariadic.h"
 
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/Signals.h"
 
+#include "llvm/IR/CFG.h"
 
 #include <dirent.h>
 #include <signal.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 
 #include <cerrno>
 #include <ctime>
@@ -61,6 +65,7 @@
 
 using namespace llvm;
 using namespace klee;
+using namespace jove;
 
 namespace {
   cl::opt<std::string>
@@ -280,6 +285,30 @@ namespace {
            cl::desc("Link the llvm libc++ library into the bitcode (default=false)"),
            cl::init(false),
            cl::cat(LinkCat));
+
+  /*** Jove options ***/
+
+  cl::OptionCategory JoveCat("jove options",
+                             "Arguments specific to jove.");
+
+  cl::opt<unsigned>
+  JovePipeFd("jove-pipefd",
+             cl::desc("write end of pipe"),
+             cl::value_desc("file descriptor"),
+             cl::Required,
+             cl::cat(JoveCat));
+
+  cl::opt<unsigned>
+  JoveBIdx("jove-binary-index",
+             cl::desc("Index of binary in decompilation under analysis"),
+             cl::Required,
+             cl::cat(JoveCat));
+
+  cl::opt<std::string>
+  JoveOutputDir("jove-output-dir",
+                cl::desc("The directory to store analysis logs"),
+                cl::Required,
+                cl::cat(JoveCat));
 }
 
 namespace klee {
@@ -1137,6 +1166,86 @@ linkWithUclibc(StringRef libDir, std::string opt_suffix,
                FortifyPath.c_str(), errorMsg.c_str());
 }
 
+static std::list<path_t>
+length_N_ForwardPathsSub(const path_t &path, unsigned radius) {
+  if (path.size() == radius) {
+    return {path};
+  } else {
+    assert(!path.empty());
+    BasicBlock *BB = path.front();
+
+    std::list<path_t> res;
+    for (BasicBlock *Pred : llvm::predecessors(BB)) {
+      if (std::find(path.begin(), path.end(), Pred) != path.end())
+        continue; /* prevent cycle */
+
+      path_t new_path(path);
+      new_path.insert(new_path.begin(), Pred);
+
+      std::list<path_t> PathList = length_N_ForwardPathsSub(new_path, radius);
+
+      for (const path_t &APath : PathList)
+        res.push_back(APath);
+    }
+
+    if (res.empty())
+      return {path};
+
+    return res;
+  }
+}
+
+static std::list<path_t>
+length_N_ForwardPaths(Instruction *JoveRecoverBBCall, unsigned radius) {
+  path_t FirstPath;
+  FirstPath.push_back(JoveRecoverBBCall->getParent());
+
+  return length_N_ForwardPathsSub(FirstPath, radius);
+}
+
+static int await_process_completion(pid_t pid) {
+  int wstatus;
+  do {
+    if (::waitpid(pid, &wstatus, WUNTRACED | WCONTINUED) < 0)
+      abort();
+
+    if (WIFEXITED(wstatus)) {
+      // printf("exited, status=%d\n", WEXITSTATUS(wstatus));
+      return WEXITSTATUS(wstatus);
+    } else if (WIFSIGNALED(wstatus)) {
+      // printf("killed by signal %d\n", WTERMSIG(wstatus));
+      return 1;
+    } else if (WIFSTOPPED(wstatus)) {
+      // printf("stopped by signal %d\n", WSTOPSIG(wstatus));
+      return 1;
+    } else if (WIFCONTINUED(wstatus)) {
+      // printf("continued\n");
+    }
+  } while (!WIFEXITED(wstatus) && !WIFSIGNALED(wstatus));
+
+  abort();
+}
+
+static std::string DescriptionOfPath(const std::list<llvm::BasicBlock*> Path) {
+  if (Path.empty())
+    return "[]";
+
+  std::string str;
+  llvm::raw_string_ostream os(str);
+
+  os << '[';
+  for (BasicBlock *BB : Path)
+    os << BB->getName() << ',';
+
+  std::string res = os.str();
+
+  res.resize(res.size() - 1);
+
+  res.push_back(']');
+
+  return res;
+}
+
 int main(int argc, char **argv, char **envp) {
   atexit(llvm_shutdown);  // Call llvm_shutdown() on exit.
 
@@ -1425,6 +1534,8 @@ int main(int argc, char **argv, char **envp) {
     handler->getInfoStream().flush();
   }
 
+#define CONFIG_JOVE
+#if !defined(CONFIG_JOVE)
   if (!ReplayKTestDir.empty() || !ReplayKTestFile.empty()) {
     assert(SeedOutFile.empty());
     assert(SeedOutDir.empty());
@@ -1520,6 +1631,79 @@ int main(int argc, char **argv, char **envp) {
       seeds.pop_back();
     }
   }
+#else
+  llvm::Function *RecoverLocalGotoFunc = finalModule->getFunction("_jove_recover_local_goto");
+  if (!RecoverLocalGotoFunc) {
+    klee_error("[JOVE] _jove_recover_basic_block() not found in module");
+    return 1;
+  }
+
+  std::set<pid_t> pids;
+
+  for (User *U : RecoverLocalGotoFunc->users()) {
+    CallInst *RecoverCall = dyn_cast<CallInst>(U);
+    if (!RecoverCall)
+      continue;
+
+    std::list<path_t> PathList = length_N_ForwardPaths(RecoverCall, 8);
+
+    assert(!PathList.empty());
+    if (std::all_of(PathList.begin(),
+                    PathList.end(),
+                    [&](const path_t &path) -> bool {
+                      return path.size() == 1;
+                    }))
+      continue;
+
+    long sz = 2 * ::sysconf(_SC_PAGESIZE);
+    void *shared_memory = mmap(nullptr, sz,
+                               PROT_READ | PROT_WRITE,
+                               MAP_ANONYMOUS | MAP_SHARED,
+                               -1, 0);
+    assert(shared_memory != MAP_FAILED);
+
+    for (const auto &path : PathList) {
+      if (path.size() == 1)
+        continue;
+
+      llvm::errs() << DescriptionOfPath(path) << '\n';
+
+      pid_t pid = fork();
+      if (pid) {
+        pids.insert(pid);
+        continue;
+      }
+
+      auto *CI = dyn_cast<ConstantInt>(RecoverCall->getOperand(0));
+      assert(CI);
+      uint32_t BBIdx = CI->getZExtValue();
+
+      std::string out_path = JoveOutputDir + "/" + std::to_string(BBIdx) + "." +
+                             DescriptionOfPath(path) + ".jove.klee";
+
+      int outfd = open(out_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0666);
+      dup2(outfd, STDOUT_FILENO);
+      dup2(outfd, STDERR_FILENO);
+
+      interpreter->jove_AnalyzeIndirectJump(path,
+                                            RecoverCall,
+                                            shared_memory,
+                                            JovePipeFd,
+                                            JoveBIdx);
+
+      llvm::errs() << "analyzed indirect jump.\n";
+      llvm::errs().flush();
+
+      return 0;
+    }
+  }
+
+  //
+  // reap children
+  //
+  for (pid_t pid : pids)
+    await_process_completion(pid);
+#endif
 
   auto endTime = std::time(nullptr);
   { // output end and elapsed time
