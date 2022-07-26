@@ -540,9 +540,7 @@ Executor::setModule(std::vector<std::unique_ptr<llvm::Module>> &modules,
   preservedFunctions.push_back("memcmp");
   preservedFunctions.push_back("memmove");
 
-#if 0
   kmodule->optimiseAndPrepare(opts, preservedFunctions);
-#endif
   kmodule->checkModule();
 
   // 4.) Manifest the module
@@ -1210,7 +1208,11 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
 void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
   if (ConstantExpr *CE = dyn_cast<ConstantExpr>(condition)) {
     if (!CE->isTrue())
+#if 0
       llvm::report_fatal_error("attempt to add invalid constraint");
+#else
+      klee_warning("attempted to add invalid constraint");
+#endif
     return;
   }
 
@@ -2099,7 +2101,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 
       ref<Expr> pc = eval(ki, 2, state).value;
 
-      auto target_recovered = [&](uint64_t target) -> void {
+      auto CommunicateTargetRecovered = [&](uint64_t target) -> void {
         auto *CI = dyn_cast<ConstantInt>(state.jove.recoverCall->getOperand(0));
         assert(CI);
 
@@ -2124,99 +2126,127 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         }
       };
 
-      if (ref<ConstantExpr> CE = dyn_cast<ConstantExpr>(pc)) {
-        HumanOut() << "pc is constant.\n";
+      assert(jove_SectsStartAddr);
+      assert(jove_SectsEndAddr);
 
-        target_recovered(CE->getZExtValue());
+      const uint64_t SectsLen = jove_SectsEndAddr - jove_SectsStartAddr;
+
+      if (ref<ConstantExpr> CE = dyn_cast<ConstantExpr>(pc)) {
+        HumanOut() << llvm::formatv("pc is constant ({0:x})\n",
+                                    CE->getZExtValue());
       } else {
         HumanOut() << "expression for program counter:\n";
         pc->dump();
         HumanOut() << '\n';
 
-        std::set<uint64_t> known_targets;
+        Expr::Width pc_width = getWidthForLLVMType(
+            state.jove.recoverCall->getOperand(1)->getType());
+        //
+        // first we need to determine: is the program counter expression
+        // constrained or not?
+        //
+        bool IsUnconstrained = false;
+        {
+          bool success = solver->mayBeTrue(
+              state.constraints,
+              UgtExpr::create(pc, ConstantExpr::create(SectsLen, pc_width)),
+              IsUnconstrained, state.queryMetaData);
 
-        auto process_target = [&](uint64_t target) -> bool {
-          bool res = known_targets.find(target) == known_targets.end();
-
-          if (res) {
-            known_targets.insert(target);
-            target_recovered(target);
-
-            addConstraint(
-                state,
-                Expr::createIsZero(EqExpr::create(
-                    pc,
-                    ConstantExpr::alloc(
-                        target,
-                        getWidthForLLVMType(state.jove.recoverCall->getOperand(1)->getType())))));
-          }
-
-          return res;
-        };
-
-        assert(jove_shared_memory);
-        int *const spin = reinterpret_cast<int *>(jove_shared_memory);
-
-        auto do_spin_lock = [](int *spin) -> void {
-          while (__sync_lock_test_and_set(spin, true)) {
-            sched_yield();
-          }
-        };
-
-        auto do_spin_unlock = [](int *spin) -> void {
-          __sync_lock_release(spin);
-        };
-
-        uint64_t last_target = 0;
-        for (;;) {
-          ref<ConstantExpr> CE;
-          bool success =
-              solver->getValue(state.constraints, pc, CE, state.queryMetaData);
-
-          if (!success)
-            break;
-          if (!CE)
-            break;
-
-          uint64_t our_target = CE->getZExtValue();
-
-          HumanOut() << llvm::formatv("our_target: {0:x}\n", our_target);
-
-          if (our_target == last_target) {
-            HumanOut() << "solver produced duplicate target\n";
-            break;
-          }
-          last_target = our_target;
-
-          do_spin_lock(spin);
-          {
-            uint64_t *p = reinterpret_cast<uint64_t *>(spin + 1);
-
-            while (*p)
-              process_target(*p++);
-
-            if (process_target(our_target))
-              *p = our_target; /* publish */
-          }
-          do_spin_unlock(spin);
+          assert(success && "FIXME: Unhandled solver failure");
+          (void)success;
         }
 
-#if 0
-        assert(!known_targets.empty());
-        HumanOut() << "known targets:";
-        for (uint64_t target : known_targets)
-          HumanOut() << llvm::formatv(" {0:x}", target);
-        HumanOut() << '\n';
-#endif
+        if (IsUnconstrained) {
+          HumanOut() << "PC expression is unconstrained, aborting\n";
+        } else {
+          std::set<uint64_t> KnownTargets;
+
+          auto ProcessTarget = [&](uint64_t Target,
+                                   bool DidWeRecover,
+                                   std::vector<uint64_t> &NewTargetsSeen) -> bool {
+            bool IsNew = KnownTargets.insert(Target).second;
+            if (IsNew) {
+              NewTargetsSeen.push_back(Target);
+
+              if (DidWeRecover)
+                CommunicateTargetRecovered(Target);
+            }
+
+            return IsNew;
+          };
+
+          assert(jove_shared_memory);
+          int *const spin = reinterpret_cast<int *>(jove_shared_memory);
+
+          auto do_spin_lock = [](int *spin) -> void {
+            while (__sync_lock_test_and_set(spin, true)) {
+              sched_yield();
+            }
+          };
+
+          auto do_spin_unlock = [](int *spin) -> void {
+            __sync_lock_release(spin);
+          };
+
+          uint64_t LastTarget = 0;
+          for (;;) {
+            ref<ConstantExpr> CE;
+            bool Success = solver->getValue(state.constraints, pc, CE,
+                                            state.queryMetaData);
+
+            if (!Success) {
+              HumanOut() << "solver failed to run\n";
+              break;
+            }
+            if (!CE) {
+              HumanOut() << "solver yielded NULL expression\n";
+              break;
+            }
+
+            uint64_t OurTarget = CE->getZExtValue();
+
+            if (OurTarget >= SectsLen) {
+              HumanOut() << llvm::formatv(
+                  "solver produced invalid target {0:x}\n", OurTarget);
+              break;
+            }
+
+            if (OurTarget == LastTarget) {
+              HumanOut() << "solver produced duplicate target\n";
+              break;
+            }
+            LastTarget = OurTarget;
+
+            HumanOut() << llvm::formatv("our target: {0:x}\n", OurTarget);
+
+            {
+              std::vector<uint64_t> NewTargetsSeen;
+
+              do_spin_lock(spin);
+              {
+                uint64_t *p = reinterpret_cast<uint64_t *>(spin + 1);
+
+                while (*p)
+                  ProcessTarget(*p++, false, NewTargetsSeen);
+
+                if (ProcessTarget(OurTarget, true, NewTargetsSeen))
+                  *p = OurTarget; /* publish */
+              }
+              do_spin_unlock(spin);
+
+              //
+              // we don't want the solver to give answers we have already seen.
+              // add the constraints here after we have finished holding the
+              // spin lock, so that if an assertion fires the other processes
+              // won't deadlock
+              //
+              for (uint64_t Target : NewTargetsSeen)
+                addConstraint(state, Expr::createIsZero(
+                    EqExpr::create(pc, ConstantExpr::alloc(Target, pc_width))));
+            }
+          }
+        }
       }
-
-#if 0
-        std::string constraint_log;
-        getConstraintLog(state, constraint_log);
-        llvm::errs() << constraint_log << '\n';
-#endif
-
-      HumanOut().flush();
 
       terminateState(state);
       haltExecution = true;
@@ -2577,7 +2607,12 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     Function *f = getTargetFunction(fp, state);
 
     if (isa<InlineAsm>(fp)) {
+#define CONFIG_JOVE
+#if defined(CONFIG_JOVE)
+      bindLocal(ki, state, joveGetUninitSymRead(state, i->getType()));
+#else
       terminateStateOnExecError(state, "inline assembly is unsupported");
+#endif
       break;
     }
 
@@ -4647,10 +4682,14 @@ void Executor::jove_AnalyzeIndirectJump(const std::list<llvm::BasicBlock *> &Pat
                                         llvm::CallInst *Call,
                                         void *shared_memory,
                                         int recover_pipefd,
-                                        unsigned BIdx) {
+                                        unsigned BIdx,
+                                        uint64_t SectsStartAddr,
+                                        uint64_t SectsEndAddr) {
   this->jove_shared_memory = shared_memory;
   this->jove_recover_pipefd = recover_pipefd;
   this->jove_BIdx = BIdx;
+  this->jove_SectsStartAddr = SectsStartAddr;
+  this->jove_SectsEndAddr = SectsEndAddr;
 
   srand(::time(nullptr));
   srandom(::time(nullptr));

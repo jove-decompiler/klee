@@ -211,6 +211,8 @@ private:
   void *jove_shared_memory = nullptr;
   int jove_recover_pipefd = -1;
   unsigned jove_BIdx;
+  uint64_t jove_SectsStartAddr;
+  uint64_t jove_SectsEndAddr;
 
   llvm::raw_ostream &HumanOut(void) {
     return llvm::errs();
@@ -540,7 +542,9 @@ public:
                                 llvm::CallInst *recoverBBCall,
                                 void *shared_memory,
                                 int recover_pipefd,
-                                unsigned BIdx) override;
+                                unsigned BIdx,
+                                uint64_t SectsStartAddr,
+                                uint64_t SectsEndAddr) override;
   void joveRun(ExecutionState &initialState) override;
 
   /*** Runtime options ***/

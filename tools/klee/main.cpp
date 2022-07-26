@@ -61,6 +61,8 @@
 #include <iomanip>
 #include <iterator>
 #include <sstream>
+#include <thread>
+#include <mutex>
 
 
 using namespace llvm;
@@ -309,6 +311,20 @@ namespace {
                 cl::desc("The directory to store analysis logs"),
                 cl::Required,
                 cl::cat(JoveCat));
+
+  cl::opt<unsigned> JoveSectsStartAddr("jove-sects-start-addr",
+                                       cl::Required,
+                                       cl::cat(JoveCat));
+
+  cl::opt<unsigned> JoveSectsEndAddr("jove-sects-end-addr",
+                                     cl::Required,
+                                     cl::cat(JoveCat));
+
+  cl::opt<unsigned>
+  JovePathLength("jove-path-length",
+                 cl::desc("Path length"),
+                 cl::init(8),
+                 cl::cat(JoveCat));
 }
 
 namespace klee {
@@ -1206,24 +1222,29 @@ length_N_ForwardPaths(Instruction *JoveRecoverBBCall, unsigned radius) {
 static int await_process_completion(pid_t pid) {
   int wstatus;
   do {
-    if (::waitpid(pid, &wstatus, WUNTRACED | WCONTINUED) < 0)
-      abort();
+    if (::waitpid(pid, &wstatus, WUNTRACED | WCONTINUED) < 0) {
+      int err = errno;
+      if (err == EINTR)
+        continue;
+
+      llvm::errs() << llvm::formatv("waitpid failed: {0}\n", strerror(err));
+    }
 
     if (WIFEXITED(wstatus)) {
       // printf("exited, status=%d\n", WEXITSTATUS(wstatus));
       return WEXITSTATUS(wstatus);
     } else if (WIFSIGNALED(wstatus)) {
       // printf("killed by signal %d\n", WTERMSIG(wstatus));
-      return 1;
+      break;
     } else if (WIFSTOPPED(wstatus)) {
       // printf("stopped by signal %d\n", WSTOPSIG(wstatus));
-      return 1;
+      break;
     } else if (WIFCONTINUED(wstatus)) {
       // printf("continued\n");
     }
   } while (!WIFEXITED(wstatus) && !WIFSIGNALED(wstatus));
 
-  abort();
+  return 1;
 }
 
 static std::string DescriptionOfPath(const std::list<llvm::BasicBlock*> Path) {
@@ -1244,6 +1265,17 @@ static std::string DescriptionOfPath(const std::list<llvm::BasicBlock*> Path) {
   res.push_back(']');
 
   return res;
+}
+
+static unsigned num_cpus(void) {
+  cpu_set_t cpu_mask;
+  if (sched_getaffinity(0, sizeof(cpu_mask), &cpu_mask) < 0) {
+    WithColor::error() << "sched_getaffinity failed : " << strerror(errno)
+                       << '\n';
+    abort();
+  }
+
+  return CPU_COUNT(&cpu_mask);
 }
 
 int main(int argc, char **argv, char **envp) {
@@ -1632,20 +1664,47 @@ int main(int argc, char **argv, char **envp) {
     }
   }
 #else
+  SmallString<128> directory(InputFile);
+
+  sys::path::remove_filename(directory);
+  if (auto ec = sys::fs::make_absolute(directory)) {
+    klee_error("unable to determine absolute path: %s", ec.message().c_str());
+  }
+
   llvm::Function *RecoverLocalGotoFunc = finalModule->getFunction("_jove_recover_local_goto");
   if (!RecoverLocalGotoFunc) {
     klee_error("[JOVE] _jove_recover_basic_block() not found in module");
     return 1;
   }
 
-  std::set<pid_t> pids;
+  std::mutex children_mtx;
+  std::set<pid_t> children;
+
+  auto child_watcher = [&](pid_t pid) -> void {
+    await_process_completion(pid);
+
+    {
+      std::lock_guard<std::mutex> lck(children_mtx);
+
+      auto it = children.find(pid);
+      if (it != children.end()) {
+        children.erase(it);
+      } else {
+        llvm::errs() << llvm::formatv(
+            "child_watcher: {0} not found in children\n", pid);
+      }
+    }
+  };
+
+  unsigned nproc = num_cpus();
 
   for (User *U : RecoverLocalGotoFunc->users()) {
     CallInst *RecoverCall = dyn_cast<CallInst>(U);
     if (!RecoverCall)
       continue;
 
-    std::list<path_t> PathList = length_N_ForwardPaths(RecoverCall, 8);
+    std::list<path_t> PathList =
+        length_N_ForwardPaths(RecoverCall, JovePathLength);
 
     assert(!PathList.empty());
     if (std::all_of(PathList.begin(),
@@ -1666,20 +1725,56 @@ int main(int argc, char **argv, char **envp) {
       if (path.size() == 1)
         continue;
 
-      llvm::errs() << DescriptionOfPath(path) << '\n';
+      //
+      // if we already have $(nproc) children running, don't proceed further
+      // with creating another child process
+      //
+      for (;;) {
+        unsigned num_children = ({
+          std::lock_guard<std::mutex> lck(children_mtx);
+          children.size();
+        });
 
-      pid_t pid = fork();
-      if (pid) {
-        pids.insert(pid);
-        continue;
+        if (num_children < nproc)
+	  break; /* proceed */
+
+        sleep(1);
       }
+
+      std::string path_desc = DescriptionOfPath(path);
 
       auto *CI = dyn_cast<ConstantInt>(RecoverCall->getOperand(0));
       assert(CI);
       uint32_t BBIdx = CI->getZExtValue();
 
-      std::string out_path = JoveOutputDir + "/" + std::to_string(BBIdx) + "." +
-                             DescriptionOfPath(path) + ".jove.klee";
+      std::string out_path =
+          directory.str().str() + "/" + std::to_string(JoveBIdx) + "-" +
+          std::to_string(BBIdx) + "_" + DescriptionOfPath(path) + ".jove.klee";
+
+      if (sys::fs::exists(out_path)) {
+        llvm::errs() << "path already explored! skipping " << path_desc << '\n';
+        llvm::errs().flush();
+        continue;
+      }
+
+      pid_t pid = fork();
+      if (pid) {
+        bool NewChild = ({
+          std::lock_guard<std::mutex> lck(children_mtx);
+
+          children.insert(pid).second;
+        });
+
+        if (!NewChild)
+          klee_error("WTF?! Duplicate child PID!");
+
+        std::thread thd(std::bind(child_watcher, pid));
+        thd.detach();
+        continue;
+      }
+
+      llvm::errs() << path_desc << '\n';
+      llvm::errs().flush();
 
       int outfd = open(out_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0666);
       dup2(outfd, STDOUT_FILENO);
@@ -1689,7 +1784,9 @@ int main(int argc, char **argv, char **envp) {
                                             RecoverCall,
                                             shared_memory,
                                             JovePipeFd,
-                                            JoveBIdx);
+                                            JoveBIdx,
+                                            JoveSectsStartAddr,
+                                            JoveSectsEndAddr);
 
       llvm::errs() << "analyzed indirect jump.\n";
       llvm::errs().flush();
@@ -1698,11 +1795,18 @@ int main(int argc, char **argv, char **envp) {
     }
   }
 
-  //
-  // reap children
-  //
-  for (pid_t pid : pids)
-    await_process_completion(pid);
+  for (;;) {
+    bool AllDone = ({
+      std::lock_guard<std::mutex> lck(children_mtx);
+
+      children.empty();
+    });
+
+    if (AllDone)
+      break;
+
+    sleep(1);
+  }
 #endif
 
   auto endTime = std::time(nullptr);

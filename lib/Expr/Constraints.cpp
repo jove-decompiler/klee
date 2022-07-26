@@ -12,6 +12,7 @@
 #include "klee/Expr/ExprVisitor.h"
 #include "klee/Module/KModule.h"
 #include "klee/Support/OptionCategories.h"
+#include "klee/Support/ErrorHandling.h"
 
 #include "llvm/IR/Function.h"
 #include "llvm/Support/CommandLine.h"
@@ -120,8 +121,13 @@ void ConstraintManager::addConstraintInternal(const ref<Expr> &e) {
 
   switch (e->getKind()) {
   case Expr::Constant:
+#if 0
     assert(cast<ConstantExpr>(e)->isTrue() &&
            "attempt to add invalid (false) constraint");
+#else
+    klee_message("WARNING: attempted to add invalid (false) constraint");
+#endif
+
     break;
 
     // split to enable finer grained independence and other optimizations

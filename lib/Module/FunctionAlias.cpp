@@ -34,6 +34,9 @@ cl::list<std::string>
 namespace klee {
 
 bool FunctionAliasPass::runOnModule(Module &M) {
+#if 1
+  return false;
+#else
   bool modified = false;
 
   assert((M.ifunc_size() == 0) && "Unexpected ifunc");
@@ -131,6 +134,7 @@ bool FunctionAliasPass::runOnModule(Module &M) {
   }
 
   return modified;
+#endif
 }
 
 const FunctionType *FunctionAliasPass::getFunctionType(const GlobalValue *gv) {

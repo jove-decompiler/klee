@@ -150,7 +150,9 @@ public:
                            llvm::CallInst *JoveRecoverBBCall,
                            void *shared_memory,
                            int recover_pipefd,
-                           unsigned BIdx) = 0;
+                           unsigned BIdx,
+                           uint64_t SectsStartAddr,
+                           uint64_t SectsEndAddr) = 0;
 
   virtual void joveRun(ExecutionState &initialState) = 0;
 
