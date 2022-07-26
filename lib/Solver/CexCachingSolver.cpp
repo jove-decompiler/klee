@@ -277,6 +277,8 @@ bool CexCachingSolver::computeValidity(const Query& query,
   Assignment *a;
   if (!getAssignment(query.withFalse(), a))
     return false;
+  if (!a)
+    return false;
   assert(a && "computeValidity() must have assignment");
   ref<Expr> q = a->evaluate(query.expr);
   assert(isa<ConstantExpr>(q) && 

@@ -174,6 +174,10 @@ injectStaticConstructorsAndDestructors(Module *m,
   if (!ctors && !dtors)
     return;
 
+#if 1
+  return;
+#endif
+
   Function *mainFn = m->getFunction(entryFunction);
   if (!mainFn)
     klee_error("Entry function '%s' not found in module.",
