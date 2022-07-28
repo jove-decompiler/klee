@@ -2217,8 +2217,6 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
             }
             LastTarget = OurTarget;
 
-            HumanOut() << llvm::formatv("our target: {0:x}\n", OurTarget);
-
             {
               std::vector<uint64_t> NewTargetsSeen;
 
@@ -2229,8 +2227,12 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
                 while (*p)
                   ProcessTarget(*p++, false, NewTargetsSeen);
 
-                if (ProcessTarget(OurTarget, true, NewTargetsSeen))
+                if (ProcessTarget(OurTarget, true, NewTargetsSeen)) {
                   *p = OurTarget; /* publish */
+
+                  HumanOut() << llvm::formatv("our pc: {0:x}\n",
+                                              OurTarget + jove_SectsStartAddr);
+                }
               }
               do_spin_unlock(spin);
 
