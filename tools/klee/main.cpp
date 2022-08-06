@@ -325,6 +325,11 @@ namespace {
                  cl::desc("Path length"),
                  cl::init(8),
                  cl::cat(JoveCat));
+
+  cl::opt<std::string> JoveSingleBBIdx(
+      "jove-single-bbidx",
+      cl::desc("Only analyze indirect jump at given basic block index"),
+      cl::cat(JoveCat));
 }
 
 namespace klee {
@@ -1698,10 +1703,24 @@ int main(int argc, char **argv, char **envp) {
 
   unsigned nproc = num_cpus();
 
+  bool SingleBBIdx = !JoveSingleBBIdx.empty();
+  if (SingleBBIdx)
+    llvm::errs() << "analyzing indirect jump @ bb #" << JoveSingleBBIdx << '\n';
+
   for (User *U : RecoverLocalGotoFunc->users()) {
     CallInst *RecoverCall = dyn_cast<CallInst>(U);
     if (!RecoverCall)
       continue;
+
+    auto *CI = dyn_cast<ConstantInt>(RecoverCall->getOperand(0));
+    assert(CI);
+    uint32_t BBIdx = CI->getZExtValue();
+    if (SingleBBIdx) {
+      if ((uint32_t)atoi(JoveSingleBBIdx.c_str()) != BBIdx)
+        continue;
+      else
+        llvm::errs() << "found recover call @ bb #" << JoveSingleBBIdx << '\n';
+    }
 
     std::list<path_t> PathList =
         length_N_ForwardPaths(RecoverCall, JovePathLength);
@@ -1742,10 +1761,6 @@ int main(int argc, char **argv, char **envp) {
       }
 
       std::string path_desc = DescriptionOfPath(path);
-
-      auto *CI = dyn_cast<ConstantInt>(RecoverCall->getOperand(0));
-      assert(CI);
-      uint32_t BBIdx = CI->getZExtValue();
 
       std::string out_path =
           directory.str().str() + "/" + std::to_string(JoveBIdx) + "-" +
