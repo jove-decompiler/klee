@@ -55,6 +55,7 @@ namespace llvm {
   class DataLayout;
   class Twine;
   class Value;
+  class GlobalVariable;
 }
 
 namespace klee {  
@@ -213,6 +214,8 @@ private:
   unsigned jove_BIdx;
   uint64_t jove_SectsStartAddr;
   uint64_t jove_SectsEndAddr;
+  llvm::GlobalVariable *jove_SectsGV = nullptr;
+  bool jove_foundIndJmp = false;
 
   llvm::raw_ostream &HumanOut(void) {
     return llvm::errs();
@@ -538,7 +541,7 @@ public:
   ref<Expr> joveGetUninitSymRead(ExecutionState &state, llvm::Type *,
                                  const std::string &name = "");
 
-  void jove_AnalyzeIndirectJump(const jove::path_t &,
+  bool jove_AnalyzeIndirectJump(const jove::path_t &,
                                 llvm::CallInst *recoverBBCall,
                                 void *shared_memory,
                                 int recover_pipefd,

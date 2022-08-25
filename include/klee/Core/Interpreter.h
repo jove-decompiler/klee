@@ -145,7 +145,7 @@ public:
                                  char **argv,
                                  char **envp) = 0;
 
-  virtual void
+  virtual bool
   jove_AnalyzeIndirectJump(const jove::path_t &,
                            llvm::CallInst *JoveRecoverBBCall,
                            void *shared_memory,
