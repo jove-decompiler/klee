@@ -1676,8 +1676,8 @@ int main(int argc, char **argv, char **envp) {
     klee_error("unable to determine absolute path: %s", ec.message().c_str());
   }
 
-  llvm::Function *RecoverLocalGotoFunc = finalModule->getFunction("_jove_recover_local_goto");
-  if (!RecoverLocalGotoFunc) {
+  llvm::Function *RecoverFunc = finalModule->getFunction("_jove_recover_basic_block");
+  if (!RecoverFunc) {
     klee_error("[JOVE] _jove_recover_basic_block() not found in module");
     return 1;
   }
@@ -1707,7 +1707,7 @@ int main(int argc, char **argv, char **envp) {
   if (SingleBBIdx)
     llvm::errs() << "analyzing indirect jump @ bb #" << JoveSingleBBIdx << '\n';
 
-  for (User *U : RecoverLocalGotoFunc->users()) {
+  for (User *U : RecoverFunc->users()) {
     CallInst *RecoverCall = dyn_cast<CallInst>(U);
     if (!RecoverCall)
       continue;
@@ -1729,7 +1729,7 @@ int main(int argc, char **argv, char **envp) {
     if (std::all_of(PathList.begin(),
                     PathList.end(),
                     [&](const path_t &path) -> bool {
-                      return path.size() == 1;
+                      return path.size() <= 1;
                     }))
       continue;
 
@@ -1741,7 +1741,7 @@ int main(int argc, char **argv, char **envp) {
     assert(shared_memory != MAP_FAILED);
 
     for (const auto &path : PathList) {
-      if (path.size() == 1)
+      if (path.size() <= 1)
         continue;
 
       //
@@ -1795,16 +1795,12 @@ int main(int argc, char **argv, char **envp) {
       dup2(outfd, STDOUT_FILENO);
       dup2(outfd, STDERR_FILENO);
 
-      interpreter->jove_AnalyzeIndirectJump(path,
-                                            RecoverCall,
-                                            shared_memory,
-                                            JovePipeFd,
-                                            JoveBIdx,
-                                            JoveSectsStartAddr,
-                                            JoveSectsEndAddr);
+      bool reached_indjmp = interpreter->jove_AnalyzeIndirectJump(
+          path, RecoverCall, shared_memory, JovePipeFd, JoveBIdx,
+          JoveSectsStartAddr, JoveSectsEndAddr);
 
-      llvm::errs() << "analyzed indirect jump.\n";
-      llvm::errs().flush();
+      if (!reached_indjmp)
+        llvm::errs() << "failed to reach indirect jump.\n";
 
       return 0;
     }

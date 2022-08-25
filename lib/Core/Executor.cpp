@@ -2097,11 +2097,27 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 
     if (std::next(state.jove.pos) == Path.end() &&
         ki->inst == state.jove.recoverCall) {
+      this->jove_foundIndJmp = true;
+
       HumanOut() << "reached indirect jump.\n";
 
       ref<Expr> pc = eval(ki, 2, state).value;
 
-      auto CommunicateTargetRecovered = [&](uint64_t target) -> void {
+      assert(jove_SectsStartAddr);
+      assert(jove_SectsEndAddr);
+      assert(jove_SectsGV);
+
+      ref<ConstantExpr> SectsBaseExpr = evalConstant(jove_SectsGV, nullptr);
+      assert(SectsBaseExpr);
+
+      const uint64_t SectsBase = SectsBaseExpr->getZExtValue();
+      const uint64_t SectsLen = jove_SectsEndAddr - jove_SectsStartAddr;
+      const uint64_t SectsEnd = SectsBase + SectsLen;
+
+      auto ReportBranchTarget = [&](uint64_t Target) -> void {
+        assert(Target >= SectsBase && Target < SectsEnd);
+        uint64_t SectsOff = Target - SectsBase;
+
         auto *CI = dyn_cast<ConstantInt>(state.jove.recoverCall->getOperand(0));
         assert(CI);
 
@@ -2113,7 +2129,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 
         *reinterpret_cast<uint32_t *>(&record[0 * sizeof(uint32_t)]) = BIdx;
         *reinterpret_cast<uint32_t *>(&record[1 * sizeof(uint32_t)]) = BBIdx;
-        *reinterpret_cast<uint64_t *>(&record[2 * sizeof(uint32_t)]) = target;
+        *reinterpret_cast<uint64_t *>(&record[2 * sizeof(uint32_t)]) = SectsOff;
 
         //
         // we have to do it in a single write
@@ -2126,11 +2142,6 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         }
       };
 
-      assert(jove_SectsStartAddr);
-      assert(jove_SectsEndAddr);
-
-      const uint64_t SectsLen = jove_SectsEndAddr - jove_SectsStartAddr;
-
       if (ref<ConstantExpr> CE = dyn_cast<ConstantExpr>(pc)) {
         HumanOut() << llvm::formatv("pc is constant ({0:x})\n",
                                     CE->getZExtValue());
@@ -2139,27 +2150,41 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         pc->dump();
         HumanOut() << '\n';
 
-        Expr::Width pc_width = getWidthForLLVMType(
-            state.jove.recoverCall->getOperand(1)->getType());
         //
         // first we need to determine: is the program counter expression
         // constrained or not?
         //
-        bool IsUnconstrained = false;
-        {
-          bool success = solver->mayBeTrue(
-              state.constraints,
-              UgtExpr::create(pc, ConstantExpr::create(SectsLen, pc_width)),
-              IsUnconstrained, state.queryMetaData);
+        auto IsUnconstrained1 = [&](void) -> bool {
+          bool res = true;
 
-          assert(success && "FIXME: Unhandled solver failure");
-          (void)success;
-        }
+          if (!solver->mayBeTrue(
+                  state.constraints,
+                  UgeExpr::create(pc, ConstantExpr::create(SectsEnd, pc->getWidth())),
+                  res, state.queryMetaData)) {
+            klee_warning("IsUnconstrained1(): solver failure");
+            return true;
+          }
 
-        if (IsUnconstrained) {
-          HumanOut() << "PC expression is unconstrained, aborting\n";
+          return res;
+        };
+
+        auto IsUnconstrained2 = [&](void) -> bool {
+          bool res = true;
+
+          if (!solver->mayBeTrue(state.constraints,
+                                 UltExpr::create(pc, ConstantExpr::create(SectsBase, pc->getWidth())),
+                                 res, state.queryMetaData)) {
+            klee_warning("IsUnconstrained2(): solver failure");
+            return true;
+          }
+
+          return res;
+        };
+
+        if (IsUnconstrained1() || IsUnconstrained2()) {
+          HumanOut() << "PC expression is unconstrained.\n";
         } else {
-          std::set<uint64_t> KnownTargets;
+          std::unordered_set<uint64_t> KnownTargets;
 
           auto ProcessTarget = [&](uint64_t Target,
                                    bool DidWeRecover,
@@ -2169,7 +2194,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
               NewTargetsSeen.push_back(Target);
 
               if (DidWeRecover)
-                CommunicateTargetRecovered(Target);
+                ReportBranchTarget(Target);
             }
 
             return IsNew;
@@ -2205,7 +2230,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 
             uint64_t OurTarget = CE->getZExtValue();
 
-            if (OurTarget >= SectsLen) {
+            if (OurTarget < SectsBase || OurTarget >= SectsEnd) {
               HumanOut() << llvm::formatv(
                   "solver produced invalid target {0:x}\n", OurTarget);
               break;
@@ -2231,7 +2256,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
                   *p = OurTarget; /* publish */
 
                   HumanOut() << llvm::formatv("our pc: {0:x}\n",
-                                              OurTarget + jove_SectsStartAddr);
+                                              (OurTarget - SectsBase) + jove_SectsStartAddr);
                 }
               }
               do_spin_unlock(spin);
@@ -2244,7 +2269,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
               //
               for (uint64_t Target : NewTargetsSeen)
                 addConstraint(state, Expr::createIsZero(
-                    EqExpr::create(pc, ConstantExpr::alloc(Target, pc_width))));
+                    EqExpr::create(pc, ConstantExpr::alloc(Target, pc->getWidth()))));
             }
           }
         }
@@ -4680,7 +4705,7 @@ void Executor::runFunctionAsMain(Function *f,
     statsTracker->done();
 }
 
-void Executor::jove_AnalyzeIndirectJump(const std::list<llvm::BasicBlock *> &Path,
+bool Executor::jove_AnalyzeIndirectJump(const std::list<llvm::BasicBlock *> &Path,
                                         llvm::CallInst *Call,
                                         void *shared_memory,
                                         int recover_pipefd,
@@ -4692,6 +4717,7 @@ void Executor::jove_AnalyzeIndirectJump(const std::list<llvm::BasicBlock *> &Pat
   this->jove_BIdx = BIdx;
   this->jove_SectsStartAddr = SectsStartAddr;
   this->jove_SectsEndAddr = SectsEndAddr;
+  this->jove_SectsGV = kmodule->module->getGlobalVariable("__jove_sections", true);
 
   srand(::time(nullptr));
   srandom(::time(nullptr));
@@ -4705,6 +4731,10 @@ void Executor::jove_AnalyzeIndirectJump(const std::list<llvm::BasicBlock *> &Pat
   state->jove.ptrPath = &Path;
   state->jove.pos = Path.begin();
   state->jove.recoverCall = Call;
+
+  llvm::errs() << "executing block " << (*state->jove.pos)->getName()
+               << " in function " << (*state->jove.pos)->getParent()->getName()
+               << '\n';
 
   if (pathWriter)
     state->pathOS = pathWriter->open();
@@ -4763,6 +4793,8 @@ void Executor::jove_AnalyzeIndirectJump(const std::list<llvm::BasicBlock *> &Pat
 
   if (statsTracker)
     statsTracker->done();
+
+  return this->jove_foundIndJmp;
 }
 
 void Executor::joveRun(ExecutionState &initialState) {
