@@ -667,7 +667,8 @@ void KleeHandler::loadPathFile(std::string name,
   while (f.good()) {
     unsigned value;
     f >> value;
-    buffer.push_back(!!value);
+    if (f.good())
+      buffer.push_back(!!value);
     f.get();
   }
 }
