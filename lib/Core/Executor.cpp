@@ -498,7 +498,7 @@ Executor::Executor(LLVMContext &ctx, const InterpreterOptions &opts,
       interpreterHandler->getOutputFilename(SOLVER_QUERIES_KQUERY_FILE_NAME));
 
   this->solver = std::make_unique<TimingSolver>(std::move(solver), EqualitySubstitution);
-  memory = new MemoryManager(&arrayCache);
+  memory = std::make_unique<MemoryManager>(&arrayCache);
 
   initializeSearchOptions();
 
@@ -593,7 +593,6 @@ Executor::setModule(std::vector<std::unique_ptr<llvm::Module>> &modules,
 }
 
 Executor::~Executor() {
-  delete memory;
   delete externalDispatcher;
   delete specialFunctionHandler;
   delete statsTracker;
@@ -4810,7 +4809,8 @@ void Executor::runFunctionAsMain(Function *f,
     }
   }
 
-  ExecutionState *state = new ExecutionState(kmodule->functionMap[f], memory);
+  ExecutionState *state =
+      new ExecutionState(kmodule->functionMap[f], memory.get());
 
   if (pathWriter) 
     state->pathOS = pathWriter->open();
@@ -4859,8 +4859,7 @@ void Executor::runFunctionAsMain(Function *f,
   processTree = nullptr;
 
   // hack to clear memory objects
-  delete memory;
-  memory = new MemoryManager(NULL);
+  memory = nullptr;
 
   globalObjects.clear();
   globalAddresses.clear();
