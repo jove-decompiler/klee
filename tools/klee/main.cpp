@@ -9,18 +9,18 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "klee/ADT/KTest.h"
 #include "klee/ADT/TreeStream.h"
 #include "klee/Config/Version.h"
 #include "klee/Core/Interpreter.h"
 #include "klee/Expr/Expr.h"
-#include "klee/ADT/KTest.h"
-#include "klee/Support/OptionCategories.h"
-#include "klee/Statistics/Statistics.h"
 #include "klee/Solver/SolverCmdLine.h"
+#include "klee/Statistics/Statistics.h"
 #include "klee/Support/Debug.h"
 #include "klee/Support/ErrorHandling.h"
 #include "klee/Support/FileHandling.h"
 #include "klee/Support/ModuleUtil.h"
+#include "klee/Support/OptionCategories.h"
 #include "klee/Support/PrintVersion.h"
 #include "klee/System/Time.h"
 
@@ -45,18 +45,18 @@ DISABLE_WARNING_DEPRECATED_DECLARATIONS
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/FormatVariadic.h"
 
-#include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/Signals.h"
 
 #include "llvm/IR/CFG.h"
+#include "llvm/Support/TargetSelect.h"
 
 #include <dirent.h>
 #include <signal.h>
-#include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <cerrno>
 #include <ctime>
@@ -66,7 +66,6 @@ DISABLE_WARNING_DEPRECATED_DECLARATIONS
 #include <sstream>
 #include <thread>
 #include <mutex>
-
 
 using namespace llvm;
 using namespace klee;
@@ -1264,13 +1263,13 @@ static unsigned num_cpus(void) {
 }
 
 int main(int argc, char **argv, char **envp) {
-  atexit(llvm_shutdown);  // Call llvm_shutdown() on exit.
+  atexit(llvm_shutdown); // Call llvm_shutdown() on exit
 
-#if LLVM_VERSION_CODE >= LLVM_VERSION(13, 0)
-  KCommandLine::HideOptions(llvm::cl::getGeneralCategory());
-#else
-  KCommandLine::HideOptions(llvm::cl::GeneralCategory);
-#endif
+  KCommandLine::KeepOnlyCategories(
+     {&ChecksCat,      &DebugCat,    &ExtCallsCat, &ExprCat,   &LinkCat,
+      &MemoryCat,      &MergeCat,    &MiscCat,     &ModuleCat, &ReplayCat,
+      &SearchCat,      &SeedingCat,  &SolvingCat,  &StartCat,  &StatsCat,
+      &TerminationCat, &TestCaseCat, &TestGenCat});
 
   llvm::InitializeNativeTarget();
 
