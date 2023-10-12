@@ -258,6 +258,11 @@ public:
     std::list<llvm::BasicBlock *>::const_iterator pos;
     llvm::Instruction* recoverCall = nullptr;
   } jove;
+
+  /// @brief Mapping symbolic address expressions to concrete base addresses
+  typedef std::map<ref<Expr>, ref<ConstantExpr>> base_addrs_t;
+  base_addrs_t base_addrs;
+
 public:
 #ifdef KLEE_UNITTEST
   // provide this function only in the context of unittests
