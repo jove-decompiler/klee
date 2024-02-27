@@ -4386,7 +4386,8 @@ void Executor::callExternalFunction(ExecutionState &state, KInstruction *target,
     return;
   }
 
-  if (!state.addressSpace.copyInConcretes()) {
+  if (!state.addressSpace.copyInConcretes(ExternalCalls ==
+                                          ExternalCallPolicy::All)) {
     terminateStateOnExecError(state, "external modified read-only object",
                               StateTerminationType::External);
     return;
@@ -4403,7 +4404,8 @@ void Executor::callExternalFunction(ExecutionState &state, KInstruction *target,
   // Update errno memory object with the errno value from the call
   int error = externalDispatcher->getLastErrno();
   state.addressSpace.copyInConcrete(result.first, result.second,
-                                    (uint64_t)&error);
+                                    (uint64_t)&error,
+                                    ExternalCalls == ExternalCallPolicy::All);
 #endif
 
   Type *resultType = target->inst->getType();
