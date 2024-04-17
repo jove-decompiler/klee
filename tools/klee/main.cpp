@@ -803,6 +803,7 @@ static const char *modelledExternals[] = {
   "__error",
   "calloc",
   "_exit",
+  "_Exit",
   "exit",
   "free",
   "abort",
