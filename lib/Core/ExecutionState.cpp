@@ -78,6 +78,7 @@ ExecutionState::ExecutionState(KFunction *kf, MemoryManager *mm)
     : pc(kf->instructions), prevPC(pc) {
   pushFrame(nullptr, kf);
   setID();
+  assert(mm->stackFactory && mm->heapFactory);
   if (mm->stackFactory && mm->heapFactory) {
     stackAllocator = mm->stackFactory.makeAllocator();
     heapAllocator = mm->heapFactory.makeAllocator();
@@ -118,7 +119,7 @@ ExecutionState::ExecutionState(const ExecutionState& state):
     forkDisabled(state.forkDisabled),
     jove{state.jove.ptrPath,
          state.jove.pos,
-         state.jove.recoverCall} {
+         state.jove.recoverCall},
     base_addrs(state.base_addrs),
     base_mos(state.base_mos) {
   for (const auto &cur_mergehandler: openMergeStack)

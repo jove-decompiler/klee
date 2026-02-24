@@ -121,7 +121,7 @@ void ConstraintManager::addConstraintInternal(const ref<Expr> &e) {
 
   switch (e->getKind()) {
   case Expr::Constant:
-#if 0
+#if 1
     assert(cast<ConstantExpr>(e)->isTrue() &&
            "attempt to add invalid (false) constraint");
 #else

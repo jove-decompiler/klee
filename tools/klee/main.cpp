@@ -48,6 +48,7 @@ DISABLE_WARNING_DEPRECATED_DECLARATIONS
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/SHA1.h"
 
 #include "llvm/Support/Signals.h"
 
@@ -61,6 +62,9 @@ DISABLE_WARNING_DEPRECATED_DECLARATIONS
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+#include <linux/prctl.h>  /* Definition of PR_* constants */
+#include <sys/prctl.h>
 
 #include <cerrno>
 #include <ctime>
@@ -338,7 +342,7 @@ namespace {
   cl::opt<unsigned>
   JovePathLength("jove-path-length",
                  cl::desc("Path length"),
-                 cl::init(8),
+                 cl::init(16),
                  cl::cat(JoveCat));
 
   cl::opt<std::string> JoveSingleBBIdx(
@@ -1373,15 +1377,30 @@ static std::string DescriptionOfPath(const std::list<llvm::BasicBlock*> Path) {
   return res;
 }
 
+static std::string
+HashOfPathFromDesc(const std::string &desc) {
+  return llvm::toHex(llvm::SHA1::hash(
+      llvm::ArrayRef<uint8_t>((const uint8_t *)desc.data(), desc.size())));
+}
+
 static unsigned num_cpus(void) {
   cpu_set_t cpu_mask;
   if (sched_getaffinity(0, sizeof(cpu_mask), &cpu_mask) < 0) {
-    WithColor::error() << "sched_getaffinity failed : " << strerror(errno)
+    llvm::errs() << "sched_getaffinity failed : " << strerror(errno)
                        << '\n';
     abort();
   }
 
   return CPU_COUNT(&cpu_mask);
+}
+
+static void AutomaticallyReap(void) {
+  struct sigaction sa;
+  sa.sa_handler = SIG_IGN;
+  sa.sa_flags = SA_NOCLDWAIT;
+  sigemptyset(&sa.sa_mask);
+
+  ::sigaction(SIGCHLD, &sa, nullptr);
 }
 
 int main(int argc, char **argv, char **envp) {
@@ -1395,7 +1414,11 @@ int main(int argc, char **argv, char **envp) {
   llvm::InitializeNativeTarget();
 
   parseArguments(argc, argv);
+#if 0
   sys::PrintStackTraceOnErrorSignal(argv[0]);
+#endif
+  //AutomaticallyReap();
+  (void)::prctl(PR_SET_PDEATHSIG, SIGTERM);
 
   if (Watchdog) {
     if (MaxTime.empty()) {
@@ -1464,7 +1487,9 @@ int main(int argc, char **argv, char **envp) {
     }
   }
 
+#if 0
   sys::SetInterruptFunction(interrupt_handle);
+#endif
 
   // Load the bytecode...
   std::string errorMsg;
@@ -1914,6 +1939,7 @@ int main(int argc, char **argv, char **envp) {
       if (path.size() <= 1)
         continue;
 
+#if 1
       //
       // if we already have $(nproc) children running, don't proceed further
       // with creating another child process
@@ -1929,12 +1955,13 @@ int main(int argc, char **argv, char **envp) {
 
         sleep(1);
       }
+#endif
 
       std::string path_desc = DescriptionOfPath(path);
 
       std::string out_path =
           directory.str().str() + "/" + std::to_string(JoveBIdx) + "-" +
-          std::to_string(BBIdx) + "_" + DescriptionOfPath(path) + ".jove.klee";
+          std::to_string(BBIdx) + "_" + HashOfPathFromDesc(path_desc) + ".jove.klee";
 
       if (sys::fs::exists(out_path)) {
         llvm::errs() << "path already explored! skipping " << path_desc << '\n';
@@ -1942,6 +1969,7 @@ int main(int argc, char **argv, char **envp) {
         continue;
       }
 
+#if 1
       pid_t pid = fork();
       if (pid) {
         bool NewChild = ({
@@ -1958,24 +1986,36 @@ int main(int argc, char **argv, char **envp) {
         continue;
       }
 
-      llvm::errs() << path_desc << '\n';
-      llvm::errs().flush();
+      (void)::prctl(PR_SET_PDEATHSIG, SIGTERM);
+#endif
 
-      int outfd = open(out_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0666);
-      dup2(outfd, STDOUT_FILENO);
-      dup2(outfd, STDERR_FILENO);
+      std::error_code EC;
+      llvm::raw_fd_ostream out(out_path.c_str(), EC);
+      if (EC) {
+        llvm::errs() << "failed to open " << out_path.c_str() << ": "
+                     << EC.message() << '\n';
+        return 1;
+      }
 
-      bool reached_indjmp = interpreter->jove_AnalyzeIndirectJump(
+      out << path_desc << '\n';
+
+      interpreter->SetHumanOut(out);
+      bool reached_indjmp = interpreter->joveRunToIndirectJump(
           path, RecoverCall, shared_memory, JovePipeFd, JoveBIdx,
           JoveSectsStartAddr, JoveSectsEndAddr);
 
-      if (!reached_indjmp)
-        llvm::errs() << "failed to reach indirect jump.\n";
+      if (reached_indjmp)
+        return 0;
 
+      out << "failed to reach indirect jump.\n";
+
+#if 0
       return 0;
+#endif
     }
   }
 
+#if 1
   for (;;) {
     bool AllDone = ({
       std::lock_guard<std::mutex> lck(children_mtx);
@@ -1988,6 +2028,7 @@ int main(int argc, char **argv, char **envp) {
 
     sleep(1);
   }
+#endif
 #endif
 
   auto endTime = std::time(nullptr);

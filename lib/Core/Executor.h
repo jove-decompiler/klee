@@ -216,9 +216,13 @@ private:
   uint64_t jove_SectsEndAddr;
   llvm::GlobalVariable *jove_SectsGV = nullptr;
   bool jove_foundIndJmp = false;
+  std::reference_wrapper<llvm::raw_ostream> HumanOutStream;
 
+  void SetHumanOut(llvm::raw_ostream &Out) override {
+    HumanOutStream = Out;
+  }
   llvm::raw_ostream &HumanOut(void) {
-    return llvm::errs();
+    return HumanOutStream.get();
   }
 
   /// Return the typeid corresponding to a certain `type_info`
@@ -562,23 +566,28 @@ public:
   //
   // jove
   //
-  MemoryObject *joveGetUninitSym(ExecutionState &state, unsigned bytes,
-                                 const std::string &name = "");
-  MemoryObject *joveGetUninitSym(ExecutionState &, llvm::Type *,
-                                 const std::string &name = "");
-  ref<Expr> joveGetUninitSymRead(ExecutionState &, unsigned bytes,
-                                 const std::string &name = "");
-  ref<Expr> joveGetUninitSymRead(ExecutionState &state, llvm::Type *,
+  ref<Expr> joveGetUninitSymRead(ExecutionState &,
+                                 llvm::Type *,
                                  const std::string &name = "");
 
-  bool jove_AnalyzeIndirectJump(const jove::path_t &,
-                                llvm::CallInst *recoverBBCall,
-                                void *shared_memory,
-                                int recover_pipefd,
-                                unsigned BIdx,
-                                uint64_t SectsStartAddr,
-                                uint64_t SectsEndAddr) override;
-  void joveRun(ExecutionState &initialState) override;
+  ref<Expr> joveGetUninitSymRead(ExecutionState &,
+                                 Expr::Width,
+                                 size_t alignment,
+                                 const std::string &name = "");
+
+  bool joveRunToIndirectJump(const jove::path_t &,
+                             llvm::CallInst *recoverBBCall,
+                             void *shared_memory,
+                             int recover_pipefd,
+                             unsigned BIdx,
+                             uint64_t SectsStartAddr,
+                             uint64_t SectsEndAddr) override;
+
+  void joveAnalyzeIndirectJump(ExecutionState &,
+                               KInstruction *ki,
+                               ref<Expr> pc);
+
+  void joveRun(ExecutionState &initialState);
 
   /*** Runtime options ***/
 

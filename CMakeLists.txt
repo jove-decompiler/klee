@@ -199,6 +199,7 @@ include(${CMAKE_SOURCE_DIR}/cmake/compiler_warnings.cmake)
 # Solvers
 ################################################################################
 # STP
+find_package(Boost REQUIRED COMPONENTS program_options)
 include(${CMAKE_SOURCE_DIR}/cmake/find_stp.cmake)
 # Z3
 include(${CMAKE_SOURCE_DIR}/cmake/find_z3.cmake)

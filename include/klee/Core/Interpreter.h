@@ -146,16 +146,14 @@ public:
                                  char **argv,
                                  char **envp) = 0;
 
-  virtual bool
-  jove_AnalyzeIndirectJump(const jove::path_t &,
-                           llvm::CallInst *JoveRecoverBBCall,
-                           void *shared_memory,
-                           int recover_pipefd,
-                           unsigned BIdx,
-                           uint64_t SectsStartAddr,
-                           uint64_t SectsEndAddr) = 0;
-
-  virtual void joveRun(ExecutionState &initialState) = 0;
+  virtual
+  bool joveRunToIndirectJump(const jove::path_t &,
+                             llvm::CallInst *recoverBBCall,
+                             void *shared_memory,
+                             int recover_pipefd,
+                             unsigned BIdx,
+                             uint64_t SectsStartAddr,
+                             uint64_t SectsEndAddr) = 0;
 
   /*** Runtime options ***/
 
@@ -183,6 +181,8 @@ public:
 
   virtual void getCoveredLines(const ExecutionState &state,
                                std::map<const std::string*, std::set<unsigned> > &res) = 0;
+
+  virtual void SetHumanOut(llvm::raw_ostream &) = 0;
 };
 
 } // End klee namespace
