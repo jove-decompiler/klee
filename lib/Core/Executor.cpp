@@ -2180,30 +2180,30 @@ bool Executor::joveAnalyzeIndirectJump(ExecutionState &state,
   };
 
   auto toAddress = [&](uint64_t PC) -> uint64_t {
-   return (PC - SectsBase) + jove_SectsStartAddr;
+    assert(isInSections(PC));
+    return (PC - SectsBase) + jove_SectsStartAddr;
   };
 
-  auto ReportBranchTarget = [&](uint64_t Target) -> void {
-    assert(Target >= SectsBase && Target < SectsEnd);
-    uint64_t SectsOff = Target - SectsBase;
+  auto ReportBranchTarget = [&](uint64_t PC) -> void {
+    const uint64_t Addr = toAddress(PC);
 
-    auto *CI = dyn_cast<ConstantInt>(state.jove.recoverCall->getOperand(0));
-    assert(CI);
+    auto *BBIdxCI = dyn_cast<ConstantInt>(state.jove.recoverCall->getOperand(0));
+    assert(BBIdxCI);
 
-    uint32_t BIdx = jove_BIdx;
-    uint32_t BBIdx = CI->getZExtValue();
+    uint32_t BIdx = this->jove_BIdx;
+    uint32_t BBIdx = BBIdxCI->getZExtValue();
 
     constexpr unsigned RECORD_LEN = 2 * sizeof(uint32_t) + sizeof(uint64_t);
     uint8_t record[RECORD_LEN];
 
     *reinterpret_cast<uint32_t *>(&record[0 * sizeof(uint32_t)]) = BIdx;
     *reinterpret_cast<uint32_t *>(&record[1 * sizeof(uint32_t)]) = BBIdx;
-    *reinterpret_cast<uint64_t *>(&record[2 * sizeof(uint32_t)]) = SectsOff;
+    *reinterpret_cast<uint64_t *>(&record[2 * sizeof(uint32_t)]) = Addr;
 
     //
     // we have to do it in a single write
     //
-    ssize_t ret = ::write(jove_recover_pipefd, &record[0], RECORD_LEN);
+    ssize_t ret = ::write(this->jove_recover_pipefd, &record[0], RECORD_LEN);
 
     if (ret != RECORD_LEN) {
       HumanOut() << llvm::formatv(
@@ -2241,6 +2241,9 @@ bool Executor::joveAnalyzeIndirectJump(ExecutionState &state,
     if (isInSections(PC)) {
       HumanOut() << llvm::formatv("program counter is ({0:x})\n",
                                   toAddress(PC));
+
+      if (targets.insert(PC))
+        ReportBranchTarget(PC);
     } else {
       HumanOut() << llvm::formatv(
           "program counter is ({0:x}), outside of sections ({1:x})\n", PC,
@@ -2293,61 +2296,48 @@ bool Executor::joveAnalyzeIndirectJump(ExecutionState &state,
 
   jove::targets_type our_targets;
 
-  auto ProcessTarget = [&](uint64_t target) -> void {
-  };
-
   bool res = false;
   uint64_t last_target = 0;
   for (;;) {
     //
     // update constraints based on new results
     //
-    targets.cvisit_all([&](uint64_t target) -> void {
-      if (our_targets.insert(target).second)
-        addConstraint(state,
-                      Expr::createIsZero(EqExpr::create(
-                          pc, ConstantExpr::alloc(target, pc->getWidth()))));
-        ;
+    targets.cvisit_all([&](uint64_t PC) -> void {
+      if (our_targets.insert(PC).second)
+        addConstraint(state, Expr::createIsZero(EqExpr::create(
+                                 pc, ConstantExpr::alloc(PC, pc->getWidth()))));
     });
 
-    ref<ConstantExpr> TargetCE;
-    bool Success = solver->getValue(state.constraints, pc, TargetCE,
+    ref<ConstantExpr> PCConstExpr;
+    bool Success = solver->getValue(state.constraints, pc, PCConstExpr,
                                     state.queryMetaData);
 
     if (!Success) {
       HumanOut() << "solver failed to run\n";
       break;
     }
-    if (!TargetCE) {
+    if (!PCConstExpr) {
       HumanOut() << "solver yielded NULL expression\n";
       break;
     }
 
-    uint64_t target = TargetCE->getZExtValue();
-
-    if (target < SectsBase || target >= SectsEnd) {
-      HumanOut() << llvm::formatv(
-        "solver produced invalid target {0:x}\n", target);
+    const uint64_t PC = PCConstExpr->getZExtValue();
+    if (!isInSections(PC)) {
+      HumanOut() << llvm::formatv("solver produced invalid PC ({0:x})\n", PC);
       break;
     }
 
-    if (target == last_target) {
-      HumanOut() << "solver produced duplicate target\n";
-      break;
-    }
-    last_target = target;
-
-    our_targets.insert(target);
-    if (targets.insert(target)) {
+    our_targets.insert(PC);
+    if (targets.insert(PC)) {
       HumanOut() << llvm::formatv("possible value for program counter: {0:x}\n",
-                                  (target - SectsBase) + jove_SectsStartAddr);
+                                  PC);
       HumanOut().flush();
-      ReportBranchTarget(target);
+      ReportBranchTarget(PC);
     }
     res = true;
 
     addConstraint(state, Expr::createIsZero(
-        EqExpr::create(pc, ConstantExpr::alloc(target, pc->getWidth()))));
+        EqExpr::create(pc, ConstantExpr::alloc(PC, pc->getWidth()))));
   }
 
   return res;

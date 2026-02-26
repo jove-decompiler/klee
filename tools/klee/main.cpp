@@ -1411,7 +1411,7 @@ static void AutomaticallyReap(void) {
 }
 
 struct shared_data_t {
-  boost::atomics::ipc_atomic<unsigned> count = 0u;
+  boost::atomics::ipc_atomic<int> count = 0u;
 };
 
 struct call_shared_data_t {
@@ -1426,6 +1426,22 @@ static UnsignedInt align_up(UnsignedInt n, UnsignedInt m) noexcept {
     return n;
   const UnsignedInt r = n % m;
   return r == 0 ? n : (n + (m - r)); // beware of potential overflow
+}
+
+static boost::atomics::ipc_atomic<int> *countp = nullptr;
+
+static void crash_handler(int sig) {
+  boost::atomics::ipc_atomic<int> *p = countp;
+  assert(p);
+  p->fetch_sub(1, boost::memory_order_relaxed);
+
+  int exit_code = 3;
+  if (sig == SIGTERM)
+    exit_code = 1;
+  else if (sig == SIGTERM)
+    exit_code = 2;
+
+  _exit(exit_code);
 }
 
 int main(int argc, char **argv, char **envp) {
@@ -1444,6 +1460,21 @@ int main(int argc, char **argv, char **envp) {
 #endif
   AutomaticallyReap();
   (void)::prctl(PR_SET_PDEATHSIG, SIGTERM);
+
+  {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = crash_handler;
+
+    if (::sigaction(SIGSEGV, &sa, nullptr) < 0 ||
+        ::sigaction(SIGABRT, &sa, nullptr) < 0 ||
+        ::sigaction(SIGBUS, &sa, nullptr) < 0) {
+      llvm::errs() << "sigaction failed: " << std::string(strerror(errno)) << '\n';
+      return 1;
+    }
+  }
 
   if (Watchdog) {
     if (MaxTime.empty()) {
@@ -1904,7 +1935,8 @@ int main(int argc, char **argv, char **envp) {
 
   interpreter->joveBegin();
 
-  unsigned nproc = num_cpus();
+  int nproc = num_cpus();
+  assert(nproc >= 1);
 
   bool SingleBBIdx = !JoveSingleBBIdx.empty();
   if (SingleBBIdx)
@@ -1923,7 +1955,9 @@ int main(int argc, char **argv, char **envp) {
   shared_data_t &shared_data =
       *shared_buff.construct<shared_data_t>(ipc::anonymous_instance)();
 
-  shared_data.count.store(0u, boost::memory_order_relaxed);
+  countp = &shared_data.count;
+
+  shared_data.count.store(0, boost::memory_order_relaxed);
 
   for (User *U : RecoverFunc->users()) {
     CallInst *RecoverCall = dyn_cast<CallInst>(U);
@@ -1986,15 +2020,15 @@ int main(int argc, char **argv, char **envp) {
       {
         bool Child = false;
         for (;;) {
-          unsigned N = shared_data.count.load(boost::memory_order_relaxed);
+          int N = shared_data.count.load(boost::memory_order_relaxed);
 
           if (N >= nproc) {
             sleep(1);
             continue;
           }
 
-          unsigned expected = N;
-          unsigned desired = N + 1;
+          int expected = N;
+          int desired = N + 1;
           if (!shared_data.count.compare_exchange_weak(expected, desired,
                                                        boost::memory_order_relaxed,
                                                        boost::memory_order_relaxed))
@@ -2017,7 +2051,7 @@ int main(int argc, char **argv, char **envp) {
 #endif
 
       BOOST_SCOPE_DEFER [&] {
-        shared_data.count.fetch_sub(1u, boost::memory_order_relaxed);
+        shared_data.count.fetch_sub(1, boost::memory_order_relaxed);
       };
 
       std::error_code EC;
@@ -2050,7 +2084,13 @@ int main(int argc, char **argv, char **envp) {
   }
 
 #if 1
-  while (shared_data.count.load(boost::memory_order_relaxed)) {
+  for (;;) {
+    int N = shared_data.count.load(boost::memory_order_relaxed);
+    assert(!(N < 0));
+
+    if (N == 0)
+      break;
+
     sleep(1);
   }
 #endif
