@@ -55,6 +55,11 @@ DISABLE_WARNING_DEPRECATED_DECLARATIONS
 #include "llvm/IR/CFG.h"
 #include "llvm/Support/TargetSelect.h"
 
+#include <boost/atomic/ipc_atomic.hpp>
+#include <boost/scope/defer.hpp>
+#include <boost/interprocess/anonymous_shared_memory.hpp>
+#include <boost/interprocess/managed_external_buffer.hpp>
+
 #include <dirent.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -78,6 +83,8 @@ DISABLE_WARNING_DEPRECATED_DECLARATIONS
 using namespace llvm;
 using namespace klee;
 using namespace jove;
+
+namespace ipc = boost::interprocess;
 
 namespace {
   cl::opt<std::string>
@@ -1403,6 +1410,24 @@ static void AutomaticallyReap(void) {
   ::sigaction(SIGCHLD, &sa, nullptr);
 }
 
+struct shared_data_t {
+  boost::atomics::ipc_atomic<unsigned> count = 0u;
+};
+
+struct call_shared_data_t {
+  jove::ipc_targets_type targets;
+
+  call_shared_data_t(jove::segment_manager_t &sm) : targets(&sm) {}
+};
+
+template <typename UnsignedInt>
+static UnsignedInt align_up(UnsignedInt n, UnsignedInt m) noexcept {
+  if (m == 0)
+    return n;
+  const UnsignedInt r = n % m;
+  return r == 0 ? n : (n + (m - r)); // beware of potential overflow
+}
+
 int main(int argc, char **argv, char **envp) {
   atexit(llvm_shutdown); // Call llvm_shutdown() on exit
 
@@ -1417,7 +1442,7 @@ int main(int argc, char **argv, char **envp) {
 #if 0
   sys::PrintStackTraceOnErrorSignal(argv[0]);
 #endif
-  //AutomaticallyReap();
+  AutomaticallyReap();
   (void)::prctl(PR_SET_PDEATHSIG, SIGTERM);
 
   if (Watchdog) {
@@ -1877,30 +1902,28 @@ int main(int argc, char **argv, char **envp) {
     return 1;
   }
 
-  std::mutex children_mtx;
-  std::set<pid_t> children;
-
-  auto child_watcher = [&](pid_t pid) -> void {
-    await_process_completion(pid);
-
-    {
-      std::lock_guard<std::mutex> lck(children_mtx);
-
-      auto it = children.find(pid);
-      if (it != children.end()) {
-        children.erase(it);
-      } else {
-        llvm::errs() << llvm::formatv(
-            "child_watcher: {0} not found in children\n", pid);
-      }
-    }
-  };
+  interpreter->joveBegin();
 
   unsigned nproc = num_cpus();
 
   bool SingleBBIdx = !JoveSingleBBIdx.empty();
   if (SingleBBIdx)
     llvm::errs() << "analyzing indirect jump @ bb #" << JoveSingleBBIdx << '\n';
+
+  //
+  // shared count integer
+  //
+  const unsigned shared_region_size =
+      align_up<unsigned>(sizeof(shared_data_t), ::sysconf(_SC_PAGESIZE));
+
+  ipc::mapped_region shared_mem(
+      ipc::anonymous_shared_memory(shared_region_size));
+  ipc::managed_external_buffer shared_buff(
+      ipc::create_only, shared_mem.get_address(), shared_region_size);
+  shared_data_t &shared_data =
+      *shared_buff.construct<shared_data_t>(ipc::anonymous_instance)();
+
+  shared_data.count.store(0u, boost::memory_order_relaxed);
 
   for (User *U : RecoverFunc->users()) {
     CallInst *RecoverCall = dyn_cast<CallInst>(U);
@@ -1928,34 +1951,20 @@ int main(int argc, char **argv, char **envp) {
                     }))
       continue;
 
-    long sz = 2 * ::sysconf(_SC_PAGESIZE);
-    void *shared_memory = mmap(nullptr, sz,
-                               PROT_READ | PROT_WRITE,
-                               MAP_ANONYMOUS | MAP_SHARED,
-                               -1, 0);
-    assert(shared_memory != MAP_FAILED);
+    const unsigned call_shared_region_size =
+        align_up<unsigned>(sizeof(call_shared_data_t), ::sysconf(_SC_PAGESIZE));
+
+    ipc::mapped_region call_shared_mem(
+        ipc::anonymous_shared_memory(call_shared_region_size));
+    ipc::managed_external_buffer call_shared_buff(
+        ipc::create_only, call_shared_mem.get_address(), call_shared_region_size);
+    call_shared_data_t &call_shared_data =
+        *call_shared_buff.construct<call_shared_data_t>(
+            ipc::anonymous_instance)(*call_shared_buff.get_segment_manager());
 
     for (const auto &path : PathList) {
       if (path.size() <= 1)
         continue;
-
-#if 1
-      //
-      // if we already have $(nproc) children running, don't proceed further
-      // with creating another child process
-      //
-      for (;;) {
-        unsigned num_children = ({
-          std::lock_guard<std::mutex> lck(children_mtx);
-          children.size();
-        });
-
-        if (num_children < nproc)
-	  break; /* proceed */
-
-        sleep(1);
-      }
-#endif
 
       std::string path_desc = DescriptionOfPath(path);
 
@@ -1970,24 +1979,46 @@ int main(int argc, char **argv, char **envp) {
       }
 
 #if 1
-      pid_t pid = fork();
-      if (pid) {
-        bool NewChild = ({
-          std::lock_guard<std::mutex> lck(children_mtx);
+      //
+      // if we already have $(nproc) children running, don't proceed further
+      // with creating another child process
+      //
+      {
+        bool Child = false;
+        for (;;) {
+          unsigned N = shared_data.count.load(boost::memory_order_relaxed);
 
-          children.insert(pid).second;
-        });
+          if (N >= nproc) {
+            sleep(1);
+            continue;
+          }
 
-        if (!NewChild)
-          klee_error("WTF?! Duplicate child PID!");
+          unsigned expected = N;
+          unsigned desired = N + 1;
+          if (!shared_data.count.compare_exchange_weak(expected, desired,
+                                                       boost::memory_order_relaxed,
+                                                       boost::memory_order_relaxed))
+            continue;
 
-        std::thread thd(std::bind(child_watcher, pid));
-        thd.detach();
-        continue;
+          pid_t pid = fork();
+          if (pid) {
+            Child = false;
+          } else {
+            Child = true;
+
+            (void)::prctl(PR_SET_PDEATHSIG, SIGTERM);
+          }
+          break;
+        }
+
+        if (!Child)
+          continue;
       }
-
-      (void)::prctl(PR_SET_PDEATHSIG, SIGTERM);
 #endif
+
+      BOOST_SCOPE_DEFER [&] {
+        shared_data.count.fetch_sub(1u, boost::memory_order_relaxed);
+      };
 
       std::error_code EC;
       llvm::raw_fd_ostream out(out_path.c_str(), EC);
@@ -2000,32 +2031,26 @@ int main(int argc, char **argv, char **envp) {
       out << path_desc << '\n';
 
       interpreter->SetHumanOut(out);
-      bool reached_indjmp = interpreter->joveRunToIndirectJump(
-          path, RecoverCall, shared_memory, JovePipeFd, JoveBIdx,
-          JoveSectsStartAddr, JoveSectsEndAddr);
+      ExecutionState *statep = interpreter->joveRunToIndirectJump(
+          path,
+          RecoverCall,
+          nullptr,
+          JovePipeFd,
+          JoveBIdx,
+          JoveSectsStartAddr,
+          JoveSectsEndAddr);
 
-      if (reached_indjmp)
-        return 0;
+      if (statep && interpreter->joveAnalyzeIndirectJump(
+                        *statep, call_shared_data.targets)) {
+        ;
+      }
 
-      out << "failed to reach indirect jump.\n";
-
-#if 0
       return 0;
-#endif
     }
   }
 
 #if 1
-  for (;;) {
-    bool AllDone = ({
-      std::lock_guard<std::mutex> lck(children_mtx);
-
-      children.empty();
-    });
-
-    if (AllDone)
-      break;
-
+  while (shared_data.count.load(boost::memory_order_relaxed)) {
     sleep(1);
   }
 #endif

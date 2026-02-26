@@ -199,7 +199,6 @@ include(${CMAKE_SOURCE_DIR}/cmake/compiler_warnings.cmake)
 # Solvers
 ################################################################################
 # STP
-find_package(Boost REQUIRED COMPONENTS program_options)
 include(${CMAKE_SOURCE_DIR}/cmake/find_stp.cmake)
 # Z3
 include(${CMAKE_SOURCE_DIR}/cmake/find_z3.cmake)
@@ -320,6 +319,21 @@ find_program(
 if (NOT SQLITE_CLI)
   set(SQLITE_CLI "")
 endif()
+
+################################################################################
+# Boost
+################################################################################
+include(FetchContent)
+
+FetchContent_Declare(
+  Boost
+  URL https://github.com/boostorg/boost/releases/download/boost-1.90.0/boost-1.90.0-cmake.tar.gz
+  URL_HASH SHA256=913ca43d49e93d1b158c9862009add1518a4c665e7853b349a6492d158b036d4
+  DOWNLOAD_EXTRACT_TIMESTAMP ON
+)
+
+set(BOOST_INCLUDE_LIBRARIES system interprocess scope unordered)
+FetchContent_MakeAvailable(Boost)
 
 ################################################################################
 # Detect libcap

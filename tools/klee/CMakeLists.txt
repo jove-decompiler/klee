@@ -6,6 +6,7 @@
 # License. See LICENSE.TXT for details.
 #
 #===------------------------------------------------------------------------===#
+
 add_executable(klee
   main.cpp
 )
@@ -15,6 +16,11 @@ set(KLEE_LIBS
 )
 
 target_link_libraries(klee ${KLEE_LIBS})
+target_link_libraries(klee
+  Boost::scope
+  Boost::interprocess
+  Boost::unordered
+)
 target_include_directories(klee PRIVATE ${KLEE_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS})
 target_compile_options(klee PRIVATE ${KLEE_COMPONENT_CXX_FLAGS})
 target_compile_definitions(klee PRIVATE ${KLEE_COMPONENT_CXX_DEFINES})

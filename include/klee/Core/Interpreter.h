@@ -17,6 +17,12 @@
 #include <vector>
 #include <list>
 
+#include <boost/unordered/unordered_flat_set.hpp>
+#include <boost/unordered/concurrent_flat_set.hpp>
+#include <boost/interprocess/allocators/allocator.hpp>
+#include <boost/interprocess/managed_external_buffer.hpp>
+#include <boost/interprocess/managed_shared_memory.hpp>
+
 struct KTest;
 
 namespace llvm {
@@ -32,6 +38,16 @@ class CallInst;
 
 namespace jove {
 typedef std::list<llvm::BasicBlock *> path_t;
+
+using segment_manager_t =
+    boost::interprocess::managed_external_buffer::segment_manager;
+
+using ipc_targets_type = boost::concurrent_flat_set<
+    uint64_t, boost::hash<uint64_t>, std::equal_to<uint64_t>,
+    boost::interprocess::allocator<uint64_t, segment_manager_t>>;
+
+using targets_type = boost::unordered::unordered_flat_set<
+    uint64_t, boost::hash<uint64_t>, std::equal_to<uint64_t>>;
 }
 
 namespace klee {
@@ -146,14 +162,19 @@ public:
                                  char **argv,
                                  char **envp) = 0;
 
-  virtual
-  bool joveRunToIndirectJump(const jove::path_t &,
-                             llvm::CallInst *recoverBBCall,
-                             void *shared_memory,
-                             int recover_pipefd,
-                             unsigned BIdx,
-                             uint64_t SectsStartAddr,
-                             uint64_t SectsEndAddr) = 0;
+  virtual void joveBegin(void) = 0;
+
+  virtual ExecutionState *
+  joveRunToIndirectJump(const jove::path_t &,
+                        llvm::CallInst *recoverBBCall,
+                        void *shared_memory,
+                        int recover_pipefd,
+                        unsigned BIdx,
+                        uint64_t SectsStartAddr,
+                        uint64_t SectsEndAddr) = 0;
+
+  virtual bool joveAnalyzeIndirectJump(ExecutionState &,
+                                       jove::ipc_targets_type &) = 0;
 
   /*** Runtime options ***/
 

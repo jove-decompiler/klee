@@ -75,7 +75,8 @@ StackFrame::~StackFrame() {
 /***/
 
 ExecutionState::ExecutionState(KFunction *kf, MemoryManager *mm)
-    : pc(kf->instructions), prevPC(pc) {
+    : pc(kf ? kf->instructions : nullptr), prevPC(pc) {
+  if (kf)
   pushFrame(nullptr, kf);
   setID();
   assert(mm->stackFactory && mm->heapFactory);

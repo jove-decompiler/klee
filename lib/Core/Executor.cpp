@@ -2162,7 +2162,8 @@ Function *Executor::getTargetFunction(Value *calledVal) {
   }
 }
 
-void Executor::joveAnalyzeIndirectJump(ExecutionState &state, KInstruction *ki, ref<Expr> pc) {
+bool Executor::joveAnalyzeIndirectJump(ExecutionState &state,
+                                       jove::ipc_targets_type &targets) {
   assert(jove_SectsStartAddr);
   assert(jove_SectsEndAddr);
   assert(jove_SectsGV);
@@ -2210,6 +2211,30 @@ void Executor::joveAnalyzeIndirectJump(ExecutionState &state, KInstruction *ki, 
     }
   };
 
+  //
+  // sanity check: make sure we are at the call to _jove_recover_basic_block
+  //
+  KInstruction *const ki = state.prevPC;
+  {
+    llvm::Instruction *Inst = ki->inst;
+
+    {
+      CallInst *Call = dyn_cast<CallInst>(Inst);
+      if (!Call ||
+          !Call->getCalledFunction() ||
+          Call->getCalledFunction()->getName() != "_jove_recover_basic_block") {
+        llvm::errs() << "ran to something other than a call to "
+                        "_jove_recover_basic_block (" << *Call << "\n";
+        return false;
+      }
+    }
+  }
+
+  //
+  // get the symbolic expression for the value of the program counter
+  //
+  ref<Expr> pc = eval(ki, 2, state).value;
+
   if (ref<ConstantExpr> CE = dyn_cast<ConstantExpr>(pc)) {
     const uint64_t PC = CE->getZExtValue();
 
@@ -2222,7 +2247,7 @@ void Executor::joveAnalyzeIndirectJump(ExecutionState &state, KInstruction *ki, 
           SectsBase);
     }
 
-    return;
+    return true;
   }
 
   HumanOut() << "expression for program counter is:\n";
@@ -2263,54 +2288,69 @@ void Executor::joveAnalyzeIndirectJump(ExecutionState &state, KInstruction *ki, 
 
   if (false /* IsUnconstrained1() || IsUnconstrained2() */) {
     HumanOut() << "expression for program counter is unconstrained.\n";
-    return;
+    return false;
   }
 
-  std::unordered_set<uint64_t> KnownTargets;
+  jove::targets_type our_targets;
 
-  auto ProcessTarget = [&](uint64_t Target) -> void {
-    if (KnownTargets.insert(Target).second)
-      ReportBranchTarget(Target);
+  auto ProcessTarget = [&](uint64_t target) -> void {
   };
 
-  uint64_t LastTarget = 0;
+  bool res = false;
+  uint64_t last_target = 0;
   for (;;) {
-    ref<ConstantExpr> CE;
-    bool Success = solver->getValue(state.constraints, pc, CE,
+    //
+    // update constraints based on new results
+    //
+    targets.cvisit_all([&](uint64_t target) -> void {
+      if (our_targets.insert(target).second)
+        addConstraint(state,
+                      Expr::createIsZero(EqExpr::create(
+                          pc, ConstantExpr::alloc(target, pc->getWidth()))));
+        ;
+    });
+
+    ref<ConstantExpr> TargetCE;
+    bool Success = solver->getValue(state.constraints, pc, TargetCE,
                                     state.queryMetaData);
 
     if (!Success) {
       HumanOut() << "solver failed to run\n";
       break;
     }
-    if (!CE) {
+    if (!TargetCE) {
       HumanOut() << "solver yielded NULL expression\n";
       break;
     }
 
-    uint64_t OurTarget = CE->getZExtValue();
+    uint64_t target = TargetCE->getZExtValue();
 
-    if (OurTarget < SectsBase || OurTarget >= SectsEnd) {
+    if (target < SectsBase || target >= SectsEnd) {
       HumanOut() << llvm::formatv(
-        "solver produced invalid target {0:x}\n", OurTarget);
+        "solver produced invalid target {0:x}\n", target);
       break;
     }
 
-    if (OurTarget == LastTarget) {
+    if (target == last_target) {
       HumanOut() << "solver produced duplicate target\n";
       break;
     }
-    LastTarget = OurTarget;
+    last_target = target;
 
-    HumanOut() << llvm::formatv("possible value for program counter: {0:x}\n",
-                                (OurTarget - SectsBase) + jove_SectsStartAddr);
-    HumanOut().flush();
-
-    ProcessTarget(OurTarget);
+    our_targets.insert(target);
+    if (targets.insert(target)) {
+      HumanOut() << llvm::formatv("possible value for program counter: {0:x}\n",
+                                  (target - SectsBase) + jove_SectsStartAddr);
+      HumanOut().flush();
+      ReportBranchTarget(target);
+    }
+    res = true;
 
     addConstraint(state, Expr::createIsZero(
-        EqExpr::create(pc, ConstantExpr::alloc(OurTarget, pc->getWidth()))));
+        EqExpr::create(pc, ConstantExpr::alloc(target, pc->getWidth()))));
   }
+
+  return res;
 }
 
 void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
@@ -2332,12 +2372,6 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     HumanOut() << *ki->inst;
     HumanOut() << '\n';
     HumanOut().flush();
-
-    ref<Expr> pc = eval(ki, 2, state).value;
-
-    joveAnalyzeIndirectJump(state, ki, pc);
-
-    terminateState(state, StateTerminationType::User);
     return;
   }
 
@@ -5037,13 +5071,21 @@ void Executor::runFunctionAsMain(Function *f,
     statsTracker->done();
 }
 
-bool Executor::joveRunToIndirectJump(const std::list<llvm::BasicBlock *> &Path,
-                                     llvm::CallInst *Call,
-                                     void *shared_memory,
-                                     int recover_pipefd,
-                                     unsigned BIdx,
-                                     uint64_t SectsStartAddr,
-                                     uint64_t SectsEndAddr) {
+void Executor::joveBegin(void) {
+  joveInitialState = std::make_unique<ExecutionState>(
+      nullptr /* kmodule->functionMap.at(f) */, memory.get());
+  initializeGlobals(*joveInitialState);
+  bindModuleConstants();
+}
+
+ExecutionState *Executor::joveRunToIndirectJump(
+    const std::list<llvm::BasicBlock *> &Path,
+    llvm::CallInst *Call,
+    void *shared_memory,
+    int recover_pipefd,
+    unsigned BIdx,
+    uint64_t SectsStartAddr,
+    uint64_t SectsEndAddr) {
   this->jove_shared_memory = shared_memory;
   this->jove_recover_pipefd = recover_pipefd;
   this->jove_BIdx = BIdx;
@@ -5061,29 +5103,41 @@ bool Executor::joveRunToIndirectJump(const std::list<llvm::BasicBlock *> &Path,
 
   assert(memory->stackFactory);
   assert(memory->heapFactory);
-  ExecutionState *state = new ExecutionState(kmodule->functionMap.at(f), memory.get());
-  state->incomingBBIndex = 0xDEADBEEF;
-  state->jove.ptrPath = &Path;
-  state->jove.pos = Path.begin();
-  state->jove.recoverCall = Call;
 
-  HumanOut() << "executing block " << (*state->jove.pos)->getName()
-             << " in function " << (*state->jove.pos)->getParent()->getName()
+  ExecutionState &state = *joveInitialState;
+  {
+    Instruction *firstInstr = &(*(*Path.begin())->begin());
+    KInstruction **kip = kf->joveInstructionMap.at(firstInstr);
+    assert(kip);
+    KInstruction *ki = *kip;
+
+    state.pc = kip;
+    state.prevPC = kip;
+  }
+  state.pushFrame(nullptr, kf);
+
+  state.incomingBBIndex = 0xDEADBEEF;
+  state.jove.ptrPath = &Path;
+  state.jove.pos = Path.begin();
+  state.jove.recoverCall = Call;
+
+  HumanOut() << "executing block " << (*state.jove.pos)->getName()
+             << " in function " << (*state.jove.pos)->getParent()->getName()
              << '\n';
 
   if (pathWriter)
-    state->pathOS = pathWriter->open();
+    state.pathOS = pathWriter->open();
   if (symPathWriter)
-    state->symPathOS = symPathWriter->open();
+    state.symPathOS = symPathWriter->open();
   if (statsTracker)
-    statsTracker->framePushed(*state, 0);
+    statsTracker->framePushed(state, 0);
 
   //
   // make all function arguments be symbolic (TODO stackpointer)
   //
   unsigned i = 0;
   for (Function::arg_iterator a_it = f->arg_begin(); a_it != f->arg_end(); ++a_it, ++i) {
-    bindArgument(kf, i, *state, joveGetUninitSymRead(*state, a_it->getType()));
+    bindArgument(kf, i, state, joveGetUninitSymRead(state, a_it->getType()));
   }
 
   //
@@ -5099,37 +5153,17 @@ bool Executor::joveRunToIndirectJump(const std::list<llvm::BasicBlock *> &Path,
       KInstruction *ki = *kip;
       assert(ki);
 
-      bindLocal(ki, *state, joveGetUninitSymRead(*state, I.getType()));
+      bindLocal(ki, state, joveGetUninitSymRead(state, I.getType()));
     }
   }
 
-  initializeGlobals(*state);
-
-  {
-    Instruction *firstInstr = &(*(*Path.begin())->begin());
-    state->pc = kf->joveInstructionMap.at(firstInstr);
-  }
-
   executionTree = createExecutionTree(
-      *state, userSearcherRequiresInMemoryExecutionTree(), *interpreterHandler);
-  joveRun(*state);
-  executionTree = nullptr;
+      state, userSearcherRequiresInMemoryExecutionTree(), *interpreterHandler);
 
-  // hack to clear memory objects
-  memory = nullptr;
-
-  globalObjects.clear();
-  globalAddresses.clear();
-
-  if (statsTracker)
-    statsTracker->done();
-
-  return this->jove_foundIndJmp;
+  return joveRun(state);
 }
 
-void Executor::joveRun(ExecutionState &initialState) {
-  bindModuleConstants();
-
+ExecutionState *Executor::joveRun(ExecutionState &initialState) {
   // Delay init till now so that ticks don't accrue during optimization and such.
   timers.reset();
 
@@ -5146,12 +5180,12 @@ void Executor::joveRun(ExecutionState &initialState) {
 
     timers.invoke();
     if (::dumpStates) dumpStates();
+
+    if (this->jove_foundIndJmp)
+      return &state;
   }
 
-  HumanOut() << "finished run.\n";
-
-  delete searcher;
-  searcher = nullptr;
+  return nullptr;
 }
 
 ref<Expr> Executor::joveGetUninitSymRead(ExecutionState &state,

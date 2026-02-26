@@ -566,6 +566,8 @@ public:
   //
   // jove
   //
+  std::unique_ptr<ExecutionState> joveInitialState;
+
   ref<Expr> joveGetUninitSymRead(ExecutionState &,
                                  llvm::Type *,
                                  const std::string &name = "");
@@ -575,19 +577,20 @@ public:
                                  size_t alignment,
                                  const std::string &name = "");
 
-  bool joveRunToIndirectJump(const jove::path_t &,
-                             llvm::CallInst *recoverBBCall,
-                             void *shared_memory,
-                             int recover_pipefd,
-                             unsigned BIdx,
-                             uint64_t SectsStartAddr,
-                             uint64_t SectsEndAddr) override;
+  void joveBegin(void) override;
 
-  void joveAnalyzeIndirectJump(ExecutionState &,
-                               KInstruction *ki,
-                               ref<Expr> pc);
+  ExecutionState *joveRunToIndirectJump(const jove::path_t &,
+                                        llvm::CallInst *recoverBBCall,
+                                        void *shared_memory,
+                                        int recover_pipefd,
+                                        unsigned BIdx,
+                                        uint64_t SectsStartAddr,
+                                        uint64_t SectsEndAddr) override;
 
-  void joveRun(ExecutionState &initialState);
+  bool joveAnalyzeIndirectJump(ExecutionState &,
+                               jove::ipc_targets_type &) override;
+
+  ExecutionState *joveRun(ExecutionState &initialState);
 
   /*** Runtime options ***/
 
