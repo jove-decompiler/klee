@@ -271,7 +271,7 @@ if (ENABLE_TCMALLOC)
   set(TCMALLOC_HEADER "gperftools/malloc_extension.h")
   find_path(TCMALLOC_INCLUDE_DIR
     "${TCMALLOC_HEADER}"
-    HINTS "${TCMALLOC_DIR}/include"
+    HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../gperftools/src"
     )
   cmake_push_check_state()
   list(APPEND CMAKE_REQUIRED_INCLUDES ${TCMALLOC_INCLUDE_DIR})
@@ -279,15 +279,24 @@ if (ENABLE_TCMALLOC)
   cmake_pop_check_state()
 
   if (${HAVE_GPERFTOOLS_MALLOC_EXTENSION_H})
-    find_library(TCMALLOC_LIBRARIES
+    find_library(TCMALLOC_LIBRARY
       NAMES tcmalloc tcmalloc_minimal
-      HINTS "${TCMALLOC_DIR}/lib"
+      HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../gperftools/build"
+      DOC "TCMalloc library"
+    )
+    find_library(TCMALLOC_COMMON_LIBRARY
+      NAMES common
+      HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../gperftools/build"
       DOC "TCMalloc libraries"
     )
-    if (NOT TCMALLOC_LIBRARIES)
+    if (NOT TCMALLOC_LIBRARY)
       message(FATAL_ERROR
         "Found \"${TCMALLOC_HEADER}\" but could not find library")
     endif()
+    list(APPEND TCMALLOC_LIBRARIES
+      ${TCMALLOC_LIBRARY}
+      ${TCMALLOC_COMMON_LIBRARY}
+    )
     list(APPEND KLEE_COMPONENT_EXTRA_INCLUDE_DIRS ${TCMALLOC_INCLUDE_DIR})
     # TCMalloc's documentation says its safest to pass these flags when
     # building with gcc because gcc can optimize assuming its using its own
@@ -327,8 +336,8 @@ include(FetchContent)
 
 FetchContent_Declare(
   Boost
-  URL https://github.com/boostorg/boost/releases/download/boost-1.90.0/boost-1.90.0-cmake.tar.gz
-  URL_HASH SHA256=913ca43d49e93d1b158c9862009add1518a4c665e7853b349a6492d158b036d4
+  URL https://github.com/boostorg/boost/releases/download/boost-1.92.0/boost-1.92.0-cmake.tar.gz
+  URL_HASH SHA256=f51707c27359a0df0cac1beada86de31bb5eed5e8285592dadec384df99c2984
   DOWNLOAD_EXTRACT_TIMESTAMP ON
 )
 
